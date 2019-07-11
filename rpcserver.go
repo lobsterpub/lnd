@@ -93,6 +93,10 @@ var (
 			Action: "read",
 		},
 		{
+			Entity: "address",
+			Action: "write",
+		},
+		{
 			Entity: "message",
 			Action: "read",
 		},
@@ -107,6 +111,10 @@ var (
 		{
 			Entity: "invoices",
 			Action: "read",
+		},
+		{
+			Entity: "invoices",
+			Action: "write",
 		},
 	}
 
