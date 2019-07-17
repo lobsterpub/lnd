@@ -73,12 +73,16 @@ type harnessTest struct {
 	// testCase is populated during test execution and represents the
 	// current test case.
 	testCase *testCase
+
+	// lndHarness is a reference to the current network harness. Will be
+	// nil if not yet set up.
+	lndHarness *lntest.NetworkHarness
 }
 
 // newHarnessTest creates a new instance of a harnessTest from a regular
 // testing.T instance.
-func newHarnessTest(t *testing.T) *harnessTest {
-	return &harnessTest{t, nil}
+func newHarnessTest(t *testing.T, net *lntest.NetworkHarness) *harnessTest {
+	return &harnessTest{t, nil, net}
 }
 
 // Skipf calls the underlying testing.T's Skip method, causing the current test
@@ -91,6 +95,10 @@ func (h *harnessTest) Skipf(format string, args ...interface{}) {
 // integration tests should mark test failures solely with this method due to
 // the error stack traces it produces.
 func (h *harnessTest) Fatalf(format string, a ...interface{}) {
+	if h.lndHarness != nil {
+		h.lndHarness.SaveProfilesPages()
+	}
+
 	stacktrace := errors.Wrap(fmt.Sprintf(format, a...), 1).ErrorStack()
 
 	if h.testCase != nil {
@@ -103,8 +111,7 @@ func (h *harnessTest) Fatalf(format string, a ...interface{}) {
 
 // RunTestCase executes a harness test case. Any errors or panics will be
 // represented as fatal.
-func (h *harnessTest) RunTestCase(testCase *testCase,
-	net *lntest.NetworkHarness) {
+func (h *harnessTest) RunTestCase(testCase *testCase) {
 
 	h.testCase = testCase
 	defer func() {
@@ -119,7 +126,7 @@ func (h *harnessTest) RunTestCase(testCase *testCase,
 		}
 	}()
 
-	testCase.test(net, h)
+	testCase.test(h.lndHarness, h)
 
 	return
 }
@@ -5965,9 +5972,12 @@ func testBasicChannelCreationAndUpdates(net *lntest.NetworkHarness, t *harnessTe
 		amount      = lnd.MaxBtcFundingAmount
 	)
 
-	// Let Bob subscribe to channel notifications.
+	// Subscribe Bob and Alice to channel event notifications.
 	bobChanSub := subscribeChannelNotifications(ctxb, t, net.Bob)
 	defer close(bobChanSub.quit)
+
+	aliceChanSub := subscribeChannelNotifications(ctxb, t, net.Alice)
+	defer close(aliceChanSub.quit)
 
 	// Open the channel between Alice and Bob, asserting that the
 	// channel has been properly open on-chain.
@@ -5982,31 +5992,52 @@ func testBasicChannelCreationAndUpdates(net *lntest.NetworkHarness, t *harnessTe
 		)
 	}
 
-	// Since each of the channels just became open, Bob should we receive an
-	// open and an active notification for each channel.
+	// Since each of the channels just became open, Bob and Alice should
+	// each receive an open and an active notification for each channel.
 	var numChannelUpds int
-	for numChannelUpds < 2*numChannels {
-		select {
-		case update := <-bobChanSub.updateChan:
-			switch update.Type {
-			case lnrpc.ChannelEventUpdate_ACTIVE_CHANNEL:
-			case lnrpc.ChannelEventUpdate_OPEN_CHANNEL:
-			default:
-				t.Fatalf("update type mismatch: expected open or active "+
-					"channel notification, got: %v", update.Type)
+	const totalNtfns = 2 * numChannels
+	verifyOpenUpdatesReceived := func(sub channelSubscription) error {
+		numChannelUpds = 0
+		for numChannelUpds < totalNtfns {
+			select {
+			case update := <-sub.updateChan:
+				switch update.Type {
+				case lnrpc.ChannelEventUpdate_ACTIVE_CHANNEL:
+					if numChannelUpds%2 != 1 {
+						return fmt.Errorf("expected open" +
+							"channel ntfn, got active " +
+							"channel ntfn instead")
+					}
+				case lnrpc.ChannelEventUpdate_OPEN_CHANNEL:
+					if numChannelUpds%2 != 0 {
+						return fmt.Errorf("expected active" +
+							"channel ntfn, got open" +
+							"channel ntfn instead")
+					}
+				default:
+					return fmt.Errorf("update type mismatch: "+
+						"expected open or active channel "+
+						"notification, got: %v",
+						update.Type)
+				}
+				numChannelUpds++
+			case <-time.After(time.Second * 10):
+				return fmt.Errorf("timeout waiting for channel "+
+					"notifications, only received %d/%d "+
+					"chanupds", numChannelUpds,
+					totalNtfns)
 			}
-			numChannelUpds++
-		case <-time.After(time.Second * 10):
-			t.Fatalf("timeout waiting for channel notifications, "+
-				"only received %d/%d chanupds", numChannelUpds,
-				numChannels)
 		}
+
+		return nil
 	}
 
-	// Subscribe Alice to channel updates so we can test that both remote
-	// and local force close notifications are received correctly.
-	aliceChanSub := subscribeChannelNotifications(ctxb, t, net.Alice)
-	defer close(aliceChanSub.quit)
+	if err := verifyOpenUpdatesReceived(bobChanSub); err != nil {
+		t.Fatalf("error verifying open updates: %v", err)
+	}
+	if err := verifyOpenUpdatesReceived(aliceChanSub); err != nil {
+		t.Fatalf("error verifying open updates: %v", err)
+	}
 
 	// Close the channel between Alice and Bob, asserting that the channel
 	// has been properly closed on-chain.
@@ -13513,7 +13544,7 @@ func testChannelBackupRestore(net *lntest.NetworkHarness, t *harnessTest) {
 
 	for _, testCase := range testCases {
 		success := t.t.Run(testCase.name, func(t *testing.T) {
-			h := newHarnessTest(t)
+			h := newHarnessTest(t, net)
 			testChanRestoreScenario(h, net, &testCase, password)
 		})
 		if !success {
@@ -14267,7 +14298,7 @@ var testsCases = []*testCase{
 // TestLightningNetworkDaemon performs a series of integration tests amongst a
 // programmatically driven network of lnd nodes.
 func TestLightningNetworkDaemon(t *testing.T) {
-	ht := newHarnessTest(t)
+	ht := newHarnessTest(t, nil)
 
 	// Declare the network harness here to gain access to its
 	// 'OnTxAccepted' call back.
@@ -14391,8 +14422,8 @@ func TestLightningNetworkDaemon(t *testing.T) {
 		}
 
 		success := t.Run(testCase.name, func(t1 *testing.T) {
-			ht := newHarnessTest(t1)
-			ht.RunTestCase(testCase, lndHarness)
+			ht := newHarnessTest(t1, lndHarness)
+			ht.RunTestCase(testCase)
 		})
 
 		// Stop at the first failure. Mimic behavior of original test
