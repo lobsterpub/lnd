@@ -90,12 +90,23 @@ func createTestCtxFromGraphInstance(startingHeight uint32, graphInstance *testGr
 		return nil, nil, err
 	}
 
-	mc := NewMissionControl(
-		&MissionControlConfig{
-			PenaltyHalfLife:       time.Hour,
-			AprioriHopProbability: 0.9,
-		},
+	pathFindingConfig := PathFindingConfig{
+		MinProbability:        0.01,
+		PaymentAttemptPenalty: 100,
+	}
+
+	mcConfig := &MissionControlConfig{
+		PenaltyHalfLife:       time.Hour,
+		AprioriHopProbability: 0.9,
+	}
+
+	mc, err := NewMissionControl(
+		graphInstance.graph.Database().DB,
+		mcConfig,
 	)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	sessionSource := &SessionSource{
 		Graph:    graphInstance.graph,
@@ -103,9 +114,8 @@ func createTestCtxFromGraphInstance(startingHeight uint32, graphInstance *testGr
 		QueryBandwidth: func(e *channeldb.ChannelEdgeInfo) lnwire.MilliSatoshi {
 			return lnwire.NewMSatFromSatoshis(e.Capacity)
 		},
-		MinRouteProbability:   0.01,
-		PaymentAttemptPenalty: 100,
-		MissionControl:        mc,
+		PathFindingConfig: pathFindingConfig,
+		MissionControl:    mc,
 	}
 
 	router, err := New(Config{
@@ -125,6 +135,7 @@ func createTestCtxFromGraphInstance(startingHeight uint32, graphInstance *testGr
 			next := atomic.AddUint64(&uniquePaymentID, 1)
 			return next, nil
 		},
+		PathFindingConfig: pathFindingConfig,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to create router %v", err)
@@ -1906,7 +1917,7 @@ func TestPruneChannelGraphStaleEdges(t *testing.T) {
 	t.Parallel()
 
 	freshTimestamp := time.Now()
-	staleTimestamp := time.Time{}
+	staleTimestamp := time.Unix(0, 0)
 
 	// We'll create the following test graph so that only the last channel
 	// is pruned.
@@ -2163,6 +2174,7 @@ func TestFindPathFeeWeighting(t *testing.T) {
 			graph: ctx.graph,
 		},
 		noRestrictions,
+		testPathFindingConfig,
 		sourceNode.PubKeyBytes, target, amt,
 	)
 	if err != nil {

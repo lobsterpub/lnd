@@ -437,12 +437,11 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 		ExtractErrorEncrypter:  s.sphinx.ExtractErrorEncrypter,
 		FetchLastChannelUpdate: s.fetchLastChanUpdate(),
 		Notifier:               s.cc.chainNotifier,
-		FwdEventTicker: ticker.New(
-			htlcswitch.DefaultFwdEventInterval),
-		LogEventTicker: ticker.New(
-			htlcswitch.DefaultLogInterval),
-		NotifyActiveChannel:   s.channelNotifier.NotifyActiveChannelEvent,
-		NotifyInactiveChannel: s.channelNotifier.NotifyInactiveChannelEvent,
+		FwdEventTicker:         ticker.New(htlcswitch.DefaultFwdEventInterval),
+		LogEventTicker:         ticker.New(htlcswitch.DefaultLogInterval),
+		AckEventTicker:         ticker.New(htlcswitch.DefaultAckInterval),
+		NotifyActiveChannel:    s.channelNotifier.NotifyActiveChannelEvent,
+		NotifyInactiveChannel:  s.channelNotifier.NotifyInactiveChannelEvent,
 	}, uint32(currentHeight))
 	if err != nil {
 		return nil, err
@@ -654,25 +653,36 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 	// servers, the mission control instance itself can be moved there too.
 	routingConfig := routerrpc.GetRoutingConfig(cfg.SubRPCServers.RouterRPC)
 
-	s.missionControl = routing.NewMissionControl(
+	s.missionControl, err = routing.NewMissionControl(
+		chanDB.DB,
 		&routing.MissionControlConfig{
 			AprioriHopProbability: routingConfig.AprioriHopProbability,
 			PenaltyHalfLife:       routingConfig.PenaltyHalfLife,
+			MaxMcHistory:          routingConfig.MaxMcHistory,
 		},
 	)
+	if err != nil {
+		return nil, fmt.Errorf("can't create mission control: %v", err)
+	}
 
 	srvrLog.Debugf("Instantiating payment session source with config: "+
 		"PaymentAttemptPenalty=%v, MinRouteProbability=%v",
-		int64(routingConfig.PaymentAttemptPenalty.ToSatoshis()),
+		int64(routingConfig.AttemptCost),
 		routingConfig.MinRouteProbability)
 
+	pathFindingConfig := routing.PathFindingConfig{
+		PaymentAttemptPenalty: lnwire.NewMSatFromSatoshis(
+			routingConfig.AttemptCost,
+		),
+		MinProbability: routingConfig.MinRouteProbability,
+	}
+
 	paymentSessionSource := &routing.SessionSource{
-		Graph:                 chanGraph,
-		MissionControl:        s.missionControl,
-		QueryBandwidth:        queryBandwidth,
-		SelfNode:              selfNode,
-		PaymentAttemptPenalty: routingConfig.PaymentAttemptPenalty,
-		MinRouteProbability:   routingConfig.MinRouteProbability,
+		Graph:             chanGraph,
+		MissionControl:    s.missionControl,
+		QueryBandwidth:    queryBandwidth,
+		SelfNode:          selfNode,
+		PathFindingConfig: pathFindingConfig,
 	}
 
 	paymentControl := channeldb.NewPaymentControl(chanDB)
@@ -692,6 +702,7 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 		QueryBandwidth:     queryBandwidth,
 		AssumeChannelValid: cfg.Routing.UseAssumeChannelValid(),
 		NextPaymentID:      sequencer.NextID,
+		PathFindingConfig:  pathFindingConfig,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("can't create router: %v", err)
@@ -708,24 +719,25 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 	}
 
 	s.authGossiper = discovery.New(discovery.Config{
-		Router:               s.chanRouter,
-		Notifier:             s.cc.chainNotifier,
-		ChainHash:            *activeNetParams.GenesisHash,
-		Broadcast:            s.BroadcastMessage,
-		ChanSeries:           chanSeries,
-		NotifyWhenOnline:     s.NotifyWhenOnline,
-		NotifyWhenOffline:    s.NotifyWhenOffline,
-		ProofMatureDelta:     0,
-		TrickleDelay:         time.Millisecond * time.Duration(cfg.TrickleDelay),
-		RetransmitDelay:      time.Minute * 30,
-		WaitingProofStore:    waitingProofStore,
-		MessageStore:         gossipMessageStore,
-		AnnSigner:            s.nodeSigner,
-		RotateTicker:         ticker.New(discovery.DefaultSyncerRotationInterval),
-		HistoricalSyncTicker: ticker.New(cfg.HistoricalSyncInterval),
-		NumActiveSyncers:     cfg.NumGraphSyncPeers,
-		MinimumBatchSize:     10,
-		SubBatchDelay:        time.Second * 5,
+		Router:                  s.chanRouter,
+		Notifier:                s.cc.chainNotifier,
+		ChainHash:               *activeNetParams.GenesisHash,
+		Broadcast:               s.BroadcastMessage,
+		ChanSeries:              chanSeries,
+		NotifyWhenOnline:        s.NotifyWhenOnline,
+		NotifyWhenOffline:       s.NotifyWhenOffline,
+		ProofMatureDelta:        0,
+		TrickleDelay:            time.Millisecond * time.Duration(cfg.TrickleDelay),
+		RetransmitDelay:         time.Minute * 30,
+		WaitingProofStore:       waitingProofStore,
+		MessageStore:            gossipMessageStore,
+		AnnSigner:               s.nodeSigner,
+		RotateTicker:            ticker.New(discovery.DefaultSyncerRotationInterval),
+		HistoricalSyncTicker:    ticker.New(cfg.HistoricalSyncInterval),
+		NumActiveSyncers:        cfg.NumGraphSyncPeers,
+		MinimumBatchSize:        10,
+		SubBatchDelay:           time.Second * 5,
+		IgnoreHistoricalFilters: cfg.IgnoreHistoricalGossipFilters,
 	},
 		s.identityPriv.PubKey(),
 	)
@@ -1051,6 +1063,8 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 		ZombieSweeperInterval:  1 * time.Minute,
 		ReservationTimeout:     10 * time.Minute,
 		MinChanSize:            btcutil.Amount(cfg.MinChanSize),
+		MaxPendingChannels:     cfg.MaxPendingChannels,
+		RejectPush:             cfg.RejectPush,
 		NotifyOpenChannelEvent: s.channelNotifier.NotifyOpenChannelEvent,
 	})
 	if err != nil {
@@ -1075,7 +1089,7 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 		return nil, err
 	}
 
-	if cfg.WtClient.IsActive() {
+	if cfg.WtClient.Active {
 		policy := wtpolicy.DefaultPolicy()
 
 		if cfg.WtClient.SweepFeeRate != 0 {
@@ -1098,8 +1112,7 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 			Dial:           cfg.net.Dial,
 			AuthDial:       wtclient.AuthDial,
 			DB:             towerClientDB,
-			Policy:         wtpolicy.DefaultPolicy(),
-			PrivateTower:   cfg.WtClient.PrivateTowers[0],
+			Policy:         policy,
 			ChainHash:      *activeNetParams.GenesisHash,
 			MinBackoff:     10 * time.Second,
 			MaxBackoff:     5 * time.Minute,
@@ -2977,8 +2990,8 @@ type openChanReq struct {
 
 	chainHash chainhash.Hash
 
-	localFundingAmt  btcutil.Amount
-	remoteFundingAmt btcutil.Amount
+	subtractFees    bool
+	localFundingAmt btcutil.Amount
 
 	pushAmt lnwire.MilliSatoshi
 

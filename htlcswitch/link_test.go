@@ -232,10 +232,10 @@ func TestChannelLinkSingleHopPayment(t *testing.T) {
 		t.Fatalf("unable to make the payment: %v", err)
 	}
 
-	// Wait for Bob to receive the revocation.
+	// Wait for Alice to receive the revocation.
 	//
 	// TODO(roasbeef); replace with select over returned err chan
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(2 * time.Second)
 
 	// Check that alice invoice was settled and bandwidth of HTLC
 	// links was changed.
@@ -494,8 +494,8 @@ func testChannelLinkMultiHopPayment(t *testing.T,
 		t.Fatalf("unable to send payment: %v", err)
 	}
 
-	// Wait for Bob to receive the revocation.
-	time.Sleep(100 * time.Millisecond)
+	// Wait for Alice and Bob's second link to receive the revocation.
+	time.Sleep(2 * time.Second)
 
 	// Check that Carol invoice was settled and bandwidth of HTLC
 	// links were changed.
@@ -1689,9 +1689,10 @@ func newSingleLinkTestHarness(chanAmt, chanReserve btcutil.Amount) (
 		FwdPkgGCTicker: ticker.NewForce(15 * time.Second),
 		// Make the BatchSize and Min/MaxFeeUpdateTimeout large enough
 		// to not trigger commit updates automatically during tests.
-		BatchSize:           10000,
-		MinFeeUpdateTimeout: 30 * time.Minute,
-		MaxFeeUpdateTimeout: 40 * time.Minute,
+		BatchSize:             10000,
+		MinFeeUpdateTimeout:   30 * time.Minute,
+		MaxFeeUpdateTimeout:   40 * time.Minute,
+		MaxOutgoingCltvExpiry: DefaultMaxOutgoingCltvExpiry,
 	}
 
 	const startingHeight = 100
@@ -3977,7 +3978,8 @@ func TestChannelLinkAcceptOverpay(t *testing.T) {
 		t.Fatalf("unable to send payment: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	// Wait for Alice and Bob's second link to receive the revocation.
+	time.Sleep(2 * time.Second)
 
 	// Even though we sent 2x what was asked for, Carol should still have
 	// accepted the payment and marked it as settled.
@@ -4237,8 +4239,9 @@ func (h *persistentLinkHarness) restartLink(
 		MinFeeUpdateTimeout: 30 * time.Minute,
 		MaxFeeUpdateTimeout: 40 * time.Minute,
 		// Set any hodl flags requested for the new link.
-		HodlMask:  hodl.MaskFromFlags(hodlFlags...),
-		DebugHTLC: len(hodlFlags) > 0,
+		HodlMask:              hodl.MaskFromFlags(hodlFlags...),
+		DebugHTLC:             len(hodlFlags) > 0,
+		MaxOutgoingCltvExpiry: DefaultMaxOutgoingCltvExpiry,
 	}
 
 	const startingHeight = 100
@@ -5558,6 +5561,7 @@ func TestHtlcSatisfyPolicy(t *testing.T) {
 				BaseFee:       10,
 			},
 			FetchLastChannelUpdate: fetchLastChannelUpdate,
+			MaxOutgoingCltvExpiry:  DefaultMaxOutgoingCltvExpiry,
 		},
 	}
 
@@ -5801,7 +5805,12 @@ func TestChannelLinkHoldInvoiceSettle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Wait for Bob to receive the revocation.
+	// Wait for Alice to receive the revocation. This is needed
+	// because the settles are pipelined to the switch and otherwise
+	// the bandwidth won't be updated by the time Alice receives a
+	// response here.
+	time.Sleep(2 * time.Second)
+
 	if ctx.startBandwidthAlice-ctx.amount !=
 		ctx.n.aliceChannelLink.Bandwidth() {
 

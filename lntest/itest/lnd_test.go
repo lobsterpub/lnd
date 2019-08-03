@@ -4,21 +4,13 @@ package itest
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/hex"
-	"encoding/pem"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"math"
-	"math/big"
-	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -43,9 +35,11 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/watchtowerrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/wtclientrpc"
 	"github.com/lightningnetwork/lnd/lntest"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/routing"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
@@ -2613,6 +2607,12 @@ func checkPendingHtlcStageAndMaturity(
 	return nil
 }
 
+// padCLTV is a small helper function that pads a cltv value with a block
+// padding.
+func padCLTV(cltv uint32) uint32 {
+	return cltv + uint32(routing.BlockPadding)
+}
+
 // testChannelForceClosure performs a test to exercise the behavior of "force"
 // closing a channel or unilaterally broadcasting the latest local commitment
 // state on-chain. The test creates a new channel between Alice and Carol, then
@@ -2741,8 +2741,8 @@ func testChannelForceClosure(net *lntest.NetworkHarness, t *harnessTest) {
 	var (
 		startHeight           = uint32(curHeight)
 		commCsvMaturityHeight = startHeight + 1 + defaultCSV
-		htlcExpiryHeight      = startHeight + defaultCLTV
-		htlcCsvMaturityHeight = startHeight + defaultCLTV + 1 + defaultCSV
+		htlcExpiryHeight      = padCLTV(startHeight + defaultCLTV)
+		htlcCsvMaturityHeight = padCLTV(startHeight + defaultCLTV + 1 + defaultCSV)
 	)
 
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
@@ -3063,8 +3063,8 @@ func testChannelForceClosure(net *lntest.NetworkHarness, t *harnessTest) {
 	// output spending from the commitment txn, so we must deduct the number
 	// of blocks we have generated since adding it to the nursery, and take
 	// an additional block off so that we end up one block shy of the expiry
-	// height.
-	cltvHeightDelta := defaultCLTV - defaultCSV - 2 - 1
+	// height, and add the block padding.
+	cltvHeightDelta := padCLTV(defaultCLTV - defaultCSV - 2 - 1)
 
 	// Advance the blockchain until just before the CLTV expires, nothing
 	// exciting should have happened during this time.
@@ -7678,7 +7678,7 @@ func testRevokedCloseRetributionAltruistWatchtower(net *lntest.NetworkHarness,
 	defer shutdownAndAssert(net, t, willy)
 
 	ctxt, _ := context.WithTimeout(ctxb, defaultTimeout)
-	willyInfo, err := willy.WatchtowerClient.GetInfo(
+	willyInfo, err := willy.Watchtower.GetInfo(
 		ctxt, &watchtowerrpc.GetInfoRequest{},
 	)
 	if err != nil {
@@ -7709,21 +7709,26 @@ func testRevokedCloseRetributionAltruistWatchtower(net *lntest.NetworkHarness,
 			externalIP, willyInfo.Uris[0])
 	}
 
-	// Construct a URI from listening port and public key, since aren't
-	// actually connecting remotely.
-	willyTowerURI := fmt.Sprintf("%x@%s", willyInfo.Pubkey, listener)
-
 	// Dave will be the breached party. We set --nolisten to ensure Carol
 	// won't be able to connect to him and trigger the channel data
 	// protection logic automatically.
 	dave, err := net.NewNode("Dave", []string{
 		"--nolisten",
-		"--wtclient.private-tower-uris=" + willyTowerURI,
+		"--wtclient.active",
 	})
 	if err != nil {
 		t.Fatalf("unable to create new node: %v", err)
 	}
 	defer shutdownAndAssert(net, t, dave)
+
+	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
+	addTowerReq := &wtclientrpc.AddTowerRequest{
+		Pubkey:  willyInfo.Pubkey,
+		Address: listener,
+	}
+	if _, err := dave.WatchtowerClient.AddTower(ctxt, addTowerReq); err != nil {
+		t.Fatalf("unable to add willy's watchtower: %v", err)
+	}
 
 	// We must let Dave have an open channel before she can send a node
 	// announcement, so we open a channel with Carol,
@@ -9417,22 +9422,30 @@ func testAsyncPayments(net *lntest.NetworkHarness, t *harnessTest) {
 
 	// Next query for Bob's and Alice's channel states, in order to confirm
 	// that all payment have been successful transmitted.
-	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	aliceChan, err := getChanInfo(ctxt, net.Alice)
-	if len(aliceChan.PendingHtlcs) != 0 {
-		t.Fatalf("alice's pending htlcs is incorrect, got %v, "+
-			"expected %v", len(aliceChan.PendingHtlcs), 0)
-	}
+
+	// Wait for the revocation to be received so alice no longer has pending
+	// htlcs listed and has correct balances. This is needed due to the fact
+	// that we now pipeline the settles.
+	err = lntest.WaitPredicate(func() bool {
+		ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
+		aliceChan, err := getChanInfo(ctxt, net.Alice)
+		if err != nil {
+			return false
+		}
+		if len(aliceChan.PendingHtlcs) != 0 {
+			return false
+		}
+		if aliceChan.RemoteBalance != bobAmt {
+			return false
+		}
+		if aliceChan.LocalBalance != aliceAmt {
+			return false
+		}
+
+		return true
+	}, time.Second*5)
 	if err != nil {
-		t.Fatalf("unable to get bob's channel info: %v", err)
-	}
-	if aliceChan.RemoteBalance != bobAmt {
-		t.Fatalf("alice's remote balance is incorrect, got %v, "+
-			"expected %v", aliceChan.RemoteBalance, bobAmt)
-	}
-	if aliceChan.LocalBalance != aliceAmt {
-		t.Fatalf("alice's local balance is incorrect, got %v, "+
-			"expected %v", aliceChan.LocalBalance, aliceAmt)
+		t.Fatalf("failed to assert alice's pending htlcs and/or remote/local balance")
 	}
 
 	// Wait for Bob to receive revocation from Alice.
@@ -9951,7 +9964,9 @@ func testMultiHopHtlcLocalTimeout(net *lntest.NetworkHarness, t *harnessTest) {
 	// commitment transaction due to the fact that the HTLC is about to
 	// timeout. With the default outgoing broadcast delta of zero, this will
 	// be the same height as the htlc expiry height.
-	numBlocks := uint32(finalCltvDelta - lnd.DefaultOutgoingBroadcastDelta)
+	numBlocks := padCLTV(
+		uint32(finalCltvDelta - lnd.DefaultOutgoingBroadcastDelta),
+	)
 	if _, err := net.Miner.Node.Generate(numBlocks); err != nil {
 		t.Fatalf("unable to generate blocks: %v", err)
 	}
@@ -10217,7 +10232,8 @@ func testMultiHopLocalForceCloseOnChainHtlcTimeout(net *lntest.NetworkHarness,
 
 	// We'll now mine enough blocks for the HTLC to expire. After this, Bob
 	// should hand off the now expired HTLC output to the utxo nursery.
-	if _, err := net.Miner.Node.Generate(finalCltvDelta - defaultCSV - 1); err != nil {
+	numBlocks := padCLTV(uint32(finalCltvDelta - defaultCSV - 1))
+	if _, err := net.Miner.Node.Generate(numBlocks); err != nil {
 		t.Fatalf("unable to generate blocks: %v", err)
 	}
 
@@ -10470,7 +10486,8 @@ func testMultiHopRemoteForceCloseOnChainHtlcTimeout(net *lntest.NetworkHarness,
 	// Next, we'll mine enough blocks for the HTLC to expire. At this
 	// point, Bob should hand off the output to his internal utxo nursery,
 	// which will broadcast a sweep transaction.
-	if _, err := net.Miner.Node.Generate(finalCltvDelta - 1); err != nil {
+	numBlocks := padCLTV(finalCltvDelta - 1)
+	if _, err := net.Miner.Node.Generate(numBlocks); err != nil {
 		t.Fatalf("unable to generate blocks: %v", err)
 	}
 
@@ -13911,133 +13928,6 @@ func testHoldInvoicePersistence(net *lntest.NetworkHarness, t *harnessTest) {
 	}
 }
 
-// testTLSAutoRegeneration creates an expired TLS certificate, to test that a
-// new TLS certificate pair is regenerated when the old pair expires. This is
-// necessary because the pair expires after a little over a year.
-func testTLSAutoRegeneration(lnNet *lntest.NetworkHarness, t *harnessTest) {
-	certPath := lnNet.Alice.TLSCertStr()
-	keyPath := lnNet.Alice.TLSKeyStr()
-
-	// Create an expired certificate.
-	expiredCert := genExpiredCertPair(
-		t, lnNet, certPath, keyPath,
-	)
-
-	// Restart the node to test that the cert is automatically regenerated.
-	lnNet.RestartNode(lnNet.Alice, nil, nil)
-
-	// Grab the newly generated certificate.
-	newCertData, err := tls.LoadX509KeyPair(certPath, keyPath)
-	if err != nil {
-		t.Fatalf("couldn't grab new certificate")
-	}
-
-	newCert, err := x509.ParseCertificate(newCertData.Certificate[0])
-	if err != nil {
-		t.Fatalf("couldn't parse new certificate")
-	}
-
-	// Check that the expired certificate was successfully deleted and
-	// replaced with a new one.
-	if !newCert.NotAfter.After(expiredCert.NotAfter) {
-		t.Fatalf("New certificate expiration is too old")
-	}
-}
-
-// genExpiredCertPair generates an expired key/cert pair to the paths
-// provided to test that expired certificates are being regenerated correctly.
-func genExpiredCertPair(t *harnessTest, lnNet *lntest.NetworkHarness, certPath,
-	keyPath string) *x509.Certificate {
-	// Max serial number.
-	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-
-	// Generate a serial number that's below the serialNumberLimit.
-	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
-	if err != nil {
-		t.Fatalf("failed to generate serial number: %s", err)
-	}
-
-	host := "lightning"
-
-	// Create a simple ip address for the fake certificate.
-	ipAddresses := []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
-
-	dnsNames := []string{host, "unix", "unixpacket"}
-
-	// Construct the certificate template.
-	template := x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject: pkix.Name{
-			Organization: []string{"lnd autogenerated cert"},
-			CommonName:   host,
-		},
-		NotBefore: time.Now().Add(-time.Hour * 24),
-		NotAfter:  time.Now(),
-
-		KeyUsage: x509.KeyUsageKeyEncipherment |
-			x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		IsCA:                  true, // so can sign self.
-		BasicConstraintsValid: true,
-
-		DNSNames:    dnsNames,
-		IPAddresses: ipAddresses,
-	}
-
-	// Generate a private key for the certificate.
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("failed to generate a private key")
-	}
-
-	derBytes, err := x509.CreateCertificate(
-		rand.Reader, &template, &template, &priv.PublicKey, priv)
-	if err != nil {
-		t.Fatalf("failed to create certificate: %v", err)
-	}
-
-	expiredCert, err := x509.ParseCertificate(derBytes)
-	if err != nil {
-		t.Fatalf("failed to parse certificate: %v", err)
-	}
-
-	certBuf := bytes.Buffer{}
-	err = pem.Encode(
-		&certBuf, &pem.Block{
-			Type:  "CERTIFICATE",
-			Bytes: derBytes,
-		},
-	)
-	if err != nil {
-		t.Fatalf("failed to encode certificate: %v", err)
-	}
-
-	keybytes, err := x509.MarshalECPrivateKey(priv)
-	if err != nil {
-		t.Fatalf("unable to encode privkey: %v", err)
-	}
-	keyBuf := bytes.Buffer{}
-	err = pem.Encode(
-		&keyBuf, &pem.Block{
-			Type:  "EC PRIVATE KEY",
-			Bytes: keybytes,
-		},
-	)
-	if err != nil {
-		t.Fatalf("failed to encode private key: %v", err)
-	}
-
-	// Write cert and key files.
-	if err = ioutil.WriteFile(certPath, certBuf.Bytes(), 0644); err != nil {
-		t.Fatalf("failed to write cert file: %v", err)
-	}
-	if err = ioutil.WriteFile(keyPath, keyBuf.Bytes(), 0600); err != nil {
-		os.Remove(certPath)
-		t.Fatalf("failed to write key file: %v", err)
-	}
-
-	return expiredCert
-}
-
 type testCase struct {
 	name string
 	test func(net *lntest.NetworkHarness, t *harnessTest)
@@ -14288,10 +14178,6 @@ var testsCases = []*testCase{
 	{
 		name: "cpfp",
 		test: testCPFP,
-	},
-	{
-		name: "automatic certificate regeneration",
-		test: testTLSAutoRegeneration,
 	},
 }
 

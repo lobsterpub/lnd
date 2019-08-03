@@ -505,8 +505,8 @@ func newRPCServer(s *server, macService *macaroons.Service,
 	err = subServerCgs.PopulateDependencies(
 		s.cc, networkDir, macService, atpl, invoiceRegistry,
 		s.htlcSwitch, activeNetParams.Params, s.chanRouter,
-		routerBackend, s.nodeSigner, s.chanDB, s.sweeper,
-		tower,
+		routerBackend, s.nodeSigner, s.chanDB, s.sweeper, tower,
+		s.towerClient, cfg.net.ResolveTCPAddr,
 	)
 	if err != nil {
 		return nil, err
@@ -4007,6 +4007,12 @@ func (r *rpcServer) GetNetworkInfo(ctx context.Context,
 		return nil, err
 	}
 
+	// Query the graph for the current number of zombie channels.
+	numZombies, err := graph.NumZombies()
+	if err != nil {
+		return nil, err
+	}
+
 	// Find the median.
 	medianChanSize = autopilot.Median(allChans)
 
@@ -4030,6 +4036,7 @@ func (r *rpcServer) GetNetworkInfo(ctx context.Context,
 		MinChannelSize:       int64(minChannelSize),
 		MaxChannelSize:       int64(maxChannelSize),
 		MedianChannelSizeSat: int64(medianChanSize),
+		NumZombieChans:       numZombies,
 	}
 
 	// Similarly, if we don't have any channels, then we'll also set the

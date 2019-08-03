@@ -8,6 +8,10 @@ import (
 	"github.com/lightningnetwork/lnd/routing/route"
 )
 
+// BlockPadding is used to increment the finalCltvDelta value for the last hop
+// to prevent an HTLC being failed if some blocks are mined while it's in-flight.
+const BlockPadding uint16 = 3
+
 // PaymentSession is used during SendPayment attempts to provide routes to
 // attempt. It also defines methods to give the PaymentSession additional
 // information learned during the previous attempts.
@@ -65,6 +69,10 @@ func (p *paymentSession) RequestRoute(payment *LightningPayment,
 		return nil, fmt.Errorf("pre-built route already tried")
 	}
 
+	// Add BlockPadding to the finalCltvDelta so that the receiving node
+	// does not reject the HTLC if some blocks are mined while it's in-flight.
+	finalCltvDelta += BlockPadding
+
 	// If a route cltv limit was specified, we need to subtract the final
 	// delta before passing it into path finding. The optimal path is
 	// independent of the final cltv delta and the path finding algorithm is
@@ -83,12 +91,10 @@ func (p *paymentSession) RequestRoute(payment *LightningPayment,
 	ss := p.sessionSource
 
 	restrictions := &RestrictParams{
-		ProbabilitySource:     ss.MissionControl.GetEdgeProbability,
-		FeeLimit:              payment.FeeLimit,
-		OutgoingChannelID:     payment.OutgoingChannelID,
-		CltvLimit:             cltvLimit,
-		PaymentAttemptPenalty: ss.PaymentAttemptPenalty,
-		MinProbability:        ss.MinRouteProbability,
+		ProbabilitySource: ss.MissionControl.GetEdgeProbability,
+		FeeLimit:          payment.FeeLimit,
+		OutgoingChannelID: payment.OutgoingChannelID,
+		CltvLimit:         cltvLimit,
 	}
 
 	path, err := p.pathFinder(
@@ -97,7 +103,8 @@ func (p *paymentSession) RequestRoute(payment *LightningPayment,
 			additionalEdges: p.additionalEdges,
 			bandwidthHints:  p.bandwidthHints,
 		},
-		restrictions, ss.SelfNode.PubKeyBytes, payment.Target,
+		restrictions, &ss.PathFindingConfig,
+		ss.SelfNode.PubKeyBytes, payment.Target,
 		payment.Amount,
 	)
 	if err != nil {
