@@ -8664,7 +8664,7 @@ out:
 		t.Fatalf("payment should have been rejected due to invalid " +
 			"payment hash")
 	}
-	expectedErrorCode := lnwire.CodeUnknownPaymentHash.String()
+	expectedErrorCode := lnwire.CodeIncorrectOrUnknownPaymentDetails.String()
 	if !strings.Contains(resp.PaymentError, expectedErrorCode) {
 		// TODO(roasbeef): make into proper gRPC error code
 		t.Fatalf("payment should have failed due to unknown payment hash, "+
@@ -8696,7 +8696,7 @@ out:
 		t.Fatalf("payment should have been rejected due to wrong " +
 			"HTLC amount")
 	}
-	expectedErrorCode = lnwire.CodeUnknownPaymentHash.String()
+	expectedErrorCode = lnwire.CodeIncorrectOrUnknownPaymentDetails.String()
 	if !strings.Contains(resp.PaymentError, expectedErrorCode) {
 		t.Fatalf("payment should have failed due to wrong amount, "+
 			"instead failed due to: %v", resp.PaymentError)
@@ -9541,6 +9541,17 @@ func testBidirectionalAsyncPayments(net *lntest.NetworkHarness, t *harnessTest) 
 	if err = net.Bob.WaitForNetworkChannelOpen(ctxt, chanPoint); err != nil {
 		t.Fatalf("bob didn't see the bob->alice channel before "+
 			"timeout: %v", err)
+	}
+
+	// Reset mission control to prevent previous payment results from
+	// interfering with this test. A new channel has been opened, but
+	// mission control operates on node pairs.
+	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
+	_, err = net.Alice.RouterClient.ResetMissionControl(
+		ctxt, &routerrpc.ResetMissionControlRequest{},
+	)
+	if err != nil {
+		t.Fatalf("unable to reset mc for alice: %v", err)
 	}
 
 	// Open up a payment streams to Alice and to Bob, that we'll use to
