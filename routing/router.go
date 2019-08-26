@@ -26,6 +26,7 @@ import (
 	"github.com/lightningnetwork/lnd/routing/chainview"
 	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/ticker"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/lightningnetwork/lnd/zpay32"
 )
 
@@ -179,8 +180,12 @@ type MissionController interface {
 	// whether this error is a final error and no further payment attempts
 	// need to be made.
 	ReportPaymentFail(paymentID uint64, rt *route.Route,
-		failureSourceIdx *int, failure lnwire.FailureMessage) (bool,
-		channeldb.FailureReason, error)
+		failureSourceIdx *int, failure lnwire.FailureMessage) (
+		*channeldb.FailureReason, error)
+
+	// ReportPaymentSuccess reports a successful payment to mission control as input
+	// for future probability estimates.
+	ReportPaymentSuccess(paymentID uint64, rt *route.Route) error
 
 	// GetProbability is expected to return the success probability of a
 	// payment from fromNode along edge.
@@ -1429,6 +1434,7 @@ type routingMsg struct {
 // factoring in channel capacities and cumulative fees along the route.
 func (r *ChannelRouter) FindRoute(source, target route.Vertex,
 	amt lnwire.MilliSatoshi, restrictions *RestrictParams,
+	destTlvRecords []tlv.Record,
 	finalExpiry ...uint16) (*route.Route, error) {
 
 	var finalCLTVDelta uint16
@@ -1482,6 +1488,7 @@ func (r *ChannelRouter) FindRoute(source, target route.Vertex,
 	// Create the route with absolute time lock values.
 	route, err := newRoute(
 		amt, source, path, uint32(currentHeight), finalCLTVDelta,
+		destTlvRecords,
 	)
 	if err != nil {
 		return nil, err
@@ -1630,7 +1637,11 @@ type LightningPayment struct {
 	// attempting to complete.
 	PaymentRequest []byte
 
-	// TODO(roasbeef): add e2e message?
+	// FinalDestRecords are TLV records that are to be sent to the final
+	// hop in the new onion payload format. If the destination does not
+	// understand this new onion payload format, then the payment will
+	// fail.
+	FinalDestRecords []tlv.Record
 }
 
 // SendPayment attempts to send a payment as described within the passed
@@ -1694,6 +1705,8 @@ func (r *ChannelRouter) preparePayment(payment *LightningPayment) (
 
 	// Record this payment hash with the ControlTower, ensuring it is not
 	// already in-flight.
+	//
+	// TODO(roasbeef): store records as part of creation info?
 	info := &channeldb.PaymentCreationInfo{
 		PaymentHash:    payment.PaymentHash,
 		Value:          payment.Amount,
@@ -1887,23 +1900,25 @@ func (r *ChannelRouter) tryApplyChannelUpdate(rt *route.Route,
 // to continue with an alternative route. This is indicated by the boolean
 // return value.
 func (r *ChannelRouter) processSendError(paymentID uint64, rt *route.Route,
-	sendErr error) (bool, channeldb.FailureReason) {
+	sendErr error) *channeldb.FailureReason {
 
-	reportFail := func(srcIdx *int, msg lnwire.FailureMessage) (bool,
-		channeldb.FailureReason) {
+	internalErrorReason := channeldb.FailureReasonError
+
+	reportFail := func(srcIdx *int,
+		msg lnwire.FailureMessage) *channeldb.FailureReason {
 
 		// Report outcome to mission control.
-		final, reason, err := r.cfg.MissionControl.ReportPaymentFail(
+		reason, err := r.cfg.MissionControl.ReportPaymentFail(
 			paymentID, rt, srcIdx, msg,
 		)
 		if err != nil {
 			log.Errorf("Error reporting payment result to mc: %v",
 				err)
 
-			return true, channeldb.FailureReasonError
+			return &internalErrorReason
 		}
 
-		return final, reason
+		return reason
 	}
 
 	if sendErr == htlcswitch.ErrUnreadableFailureMessage {
@@ -1915,7 +1930,7 @@ func (r *ChannelRouter) processSendError(paymentID uint64, rt *route.Route,
 	// trying.
 	fErr, ok := sendErr.(*htlcswitch.ForwardingError)
 	if !ok {
-		return true, channeldb.FailureReasonError
+		return &internalErrorReason
 	}
 
 	failureMessage := fErr.FailureMessage
@@ -1928,7 +1943,7 @@ func (r *ChannelRouter) processSendError(paymentID uint64, rt *route.Route,
 			rt, failureSourceIdx, failureMessage,
 		)
 		if err != nil {
-			return true, channeldb.FailureReasonError
+			return &internalErrorReason
 		}
 	}
 

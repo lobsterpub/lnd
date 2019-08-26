@@ -913,6 +913,12 @@ func (d *AuthenticatedGossiper) networkHandler() {
 			policyUpdate.errResp <- nil
 
 		case announcement := <-d.networkMsgs:
+			// We should only broadcast this message forward if it
+			// originated from us or it wasn't received as part of
+			// our initial historical sync.
+			shouldBroadcast := !announcement.isRemote ||
+				d.syncMgr.IsGraphSynced()
+
 			switch announcement.msg.(type) {
 			// Channel announcement signatures are amongst the only
 			// messages that we'll process serially.
@@ -981,12 +987,16 @@ func (d *AuthenticatedGossiper) networkHandler() {
 				// the emitted announcements to our announce
 				// batch to be broadcast once the trickle timer
 				// ticks gain.
-				if emittedAnnouncements != nil {
+				if emittedAnnouncements != nil && shouldBroadcast {
 					// TODO(roasbeef): exclude peer that
 					// sent.
 					announcements.AddMsgs(
 						emittedAnnouncements...,
 					)
+				} else if emittedAnnouncements != nil {
+					log.Trace("Skipping broadcast of " +
+						"announcements received " +
+						"during initial graph sync")
 				}
 
 			}()
@@ -2010,8 +2020,8 @@ func (d *AuthenticatedGossiper) processNetworkAnnouncement(
 			prefix = "remote"
 		}
 
-		log.Infof("Received new %v channel announcement: %v", prefix,
-			spew.Sdump(msg))
+		log.Infof("Received new %v channel announcement for %v", prefix,
+			msg.ShortChannelID)
 
 		// By the specification, channel announcement proofs should be
 		// sent after some number of confirmations after channel was

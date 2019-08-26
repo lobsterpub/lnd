@@ -313,6 +313,12 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 
 	globalFeatures := lnwire.NewRawFeatureVector()
 
+	// Only if we're not being forced to use the legacy onion format, will
+	// we signal our knowledge of the new TLV onion format.
+	if !cfg.LegacyProtocol.LegacyOnion() {
+		globalFeatures.Set(lnwire.TLVOnionPayloadOptional)
+	}
+
 	var serializedPubKey [33]byte
 	copy(serializedPubKey[:], privKey.PubKey().SerializeCompressed())
 
@@ -394,16 +400,6 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 	s.witnessBeacon = &preimageBeacon{
 		wCache:      chanDB.NewWitnessCache(),
 		subscribers: make(map[uint64]*preimageSubscriber),
-	}
-
-	// If the debug HTLC flag is on, then we invoice a "master debug"
-	// invoice which all outgoing payments will be sent and all incoming
-	// HTLCs with the debug R-Hash immediately settled.
-	if cfg.DebugHTLC {
-		kiloCoin := btcutil.Amount(btcutil.SatoshiPerBitcoin * 1000)
-		s.invoices.AddDebugInvoice(kiloCoin, invoices.DebugPre)
-		srvrLog.Debugf("Debug HTLC invoice inserted, preimage=%x, hash=%x",
-			invoices.DebugPre[:], invoices.DebugHash[:])
 	}
 
 	_, currentHeight, err := s.cc.chainIO.GetBestBlock()

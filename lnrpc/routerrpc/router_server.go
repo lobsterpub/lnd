@@ -249,7 +249,7 @@ func (s *Server) EstimateRouteFee(ctx context.Context,
 		s.cfg.RouterBackend.SelfNode, destNode, amtMsat,
 		&routing.RestrictParams{
 			FeeLimit: feeLimit,
-		},
+		}, nil,
 	)
 	if err != nil {
 		return nil, err
@@ -473,13 +473,14 @@ func (s *Server) QueryMissionControl(ctx context.Context,
 		pair := p
 
 		rpcPair := PairHistory{
-			NodeFrom:     pair.Pair.From[:],
-			NodeTo:       pair.Pair.To[:],
-			LastFailTime: pair.LastFail.Unix(),
+			NodeFrom:  pair.Pair.From[:],
+			NodeTo:    pair.Pair.To[:],
+			Timestamp: pair.Timestamp.Unix(),
 			MinPenalizeAmtSat: int64(
 				pair.MinPenalizeAmt.ToSatoshis(),
 			),
-			SuccessProb: float32(pair.SuccessProb),
+			SuccessProb:           float32(pair.SuccessProb),
+			LastAttemptSuccessful: pair.LastAttemptSuccessful,
 		}
 
 		rpcPairs = append(rpcPairs, &rpcPair)
@@ -550,9 +551,12 @@ func (s *Server) trackPayment(paymentHash lntypes.Hash,
 
 			status.State = PaymentState_SUCCEEDED
 			status.Preimage = result.Preimage[:]
-			status.Route = router.MarshallRoute(
+			status.Route, err = router.MarshallRoute(
 				result.Route,
 			)
+			if err != nil {
+				return err
+			}
 		} else {
 			state, err := marshallFailureReason(
 				result.FailureReason,
@@ -562,9 +566,12 @@ func (s *Server) trackPayment(paymentHash lntypes.Hash,
 			}
 			status.State = state
 			if result.Route != nil {
-				status.Route = router.MarshallRoute(
+				status.Route, err = router.MarshallRoute(
 					result.Route,
 				)
+				if err != nil {
+					return err
+				}
 			}
 		}
 

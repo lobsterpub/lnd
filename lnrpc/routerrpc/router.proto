@@ -63,6 +63,13 @@ message SendPaymentRequest {
     Optional route hints to reach the destination through private channels.
     */
     repeated lnrpc.RouteHint route_hints = 10 [json_name = "route_hints"];
+
+    /** 
+    An optional field that can be used to pass an arbitrary set of TLV records
+    to a peer which understands the new records. This can be used to pass
+    application specific data during the payment attempt.
+    */
+    map<uint64, bytes> dest_tlv = 11;
 }
 
 message TrackPaymentRequest {
@@ -326,10 +333,10 @@ message QueryMissionControlRequest {}
 /// QueryMissionControlResponse contains mission control state.
 message QueryMissionControlResponse {
     /// Node-level mission control state.
-    repeated NodeHistory nodes = 1;
+    repeated NodeHistory nodes = 1 [json_name = "nodes"];
 
     /// Node pair-level mission control state.
-    repeated PairHistory pairs = 2;
+    repeated PairHistory pairs = 2 [json_name = "pairs"];
 }
 
 /// NodeHistory contains the mission control state for a particular node.
@@ -352,19 +359,22 @@ message NodeHistory {
 /// PairHistory contains the mission control state for a particular node pair.
 message PairHistory {
     /// The source node pubkey of the pair.
-    bytes node_from = 1 [json_name="node_from"];
+    bytes node_from = 1 [json_name ="node_from"];
     
     /// The destination node pubkey of the pair.
     bytes node_to = 2 [json_name="node_to"];
     
-    /// Time stamp of last failure.
-    int64 last_fail_time = 3 [json_name = "last_fail_time"];
+    /// Time stamp of last result.
+    int64 timestamp = 3 [json_name = "timestamp"];
 
-    /// Minimum penalization amount.
+    /// Minimum penalization amount (only applies to failed attempts).
     int64 min_penalize_amt_sat = 4 [json_name = "min_penalize_amt_sat"];
 
     /// Estimation of success probability for this pair.
     float success_prob = 5 [json_name = "success_prob"];
+
+    /// Whether the last payment attempt through this pair was successful.
+    bool last_attempt_successful = 6 [json_name = "last_attempt_successful"];
 }
 
 service Router {

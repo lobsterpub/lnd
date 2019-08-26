@@ -2372,10 +2372,7 @@ func testChannelUnsettledBalance(net *lntest.NetworkHarness, t *harnessTest) {
 	ctxb := context.Background()
 
 	// Create carol in hodl mode.
-	carol, err := net.NewNode("Carol", []string{
-		"--debughtlc",
-		"--hodl.exit-settle",
-	})
+	carol, err := net.NewNode("Carol", []string{"--hodl.exit-settle"})
 	if err != nil {
 		t.Fatalf("unable to create new nodes: %v", err)
 	}
@@ -2642,7 +2639,7 @@ func testChannelForceClosure(net *lntest.NetworkHarness, t *harnessTest) {
 
 	// Since we'd like to test failure scenarios with outstanding htlcs,
 	// we'll introduce another node into our test network: Carol.
-	carol, err := net.NewNode("Carol", []string{"--debughtlc", "--hodl.exit-settle"})
+	carol, err := net.NewNode("Carol", []string{"--hodl.exit-settle"})
 	if err != nil {
 		t.Fatalf("unable to create new nodes: %v", err)
 	}
@@ -3420,7 +3417,7 @@ func testSphinxReplayPersistence(net *lntest.NetworkHarness, t *harnessTest) {
 	chanAmt := btcutil.Amount(100000)
 
 	// First, we'll create Dave, the receiver, and start him in hodl mode.
-	dave, err := net.NewNode("Dave", []string{"--debughtlc", "--hodl.exit-settle"})
+	dave, err := net.NewNode("Dave", []string{"--hodl.exit-settle"})
 	if err != nil {
 		t.Fatalf("unable to create new nodes: %v", err)
 	}
@@ -3570,7 +3567,7 @@ func testSphinxReplayPersistence(net *lntest.NetworkHarness, t *harnessTest) {
 
 	// Construct the response we expect after sending a duplicate packet
 	// that fails due to sphinx replay detection.
-	replayErr := "TemporaryChannelFailure"
+	replayErr := "InvalidOnionKey"
 	if !strings.Contains(resp.PaymentError, replayErr) {
 		t.Fatalf("received payment error: %v, expected %v",
 			resp.PaymentError, replayErr)
@@ -4016,13 +4013,15 @@ func testMultiHopPayments(net *lntest.NetworkHarness, t *harnessTest) {
 	}
 
 	// As preliminary setup, we'll create two new nodes: Carol and Dave,
-	// such that we now have a 4 ndoe, 3 channel topology. Dave will make
-	// a channel with Alice, and Carol with Dave. After this setup, the
+	// such that we now have a 4 node, 3 channel topology. Dave will make a
+	// channel with Alice, and Carol with Dave. After this setup, the
 	// network topology should now look like:
 	//     Carol -> Dave -> Alice -> Bob
 	//
-	// First, we'll create Dave and establish a channel to Alice.
-	dave, err := net.NewNode("Dave", nil)
+	// First, we'll create Dave and establish a channel to Alice. Dave will
+	// be running an older node that requires the legacy onion payload.
+	daveArgs := []string{"--legacyprotocol.onion"}
+	dave, err := net.NewNode("Dave", daveArgs)
 	if err != nil {
 		t.Fatalf("unable to create new nodes: %v", err)
 	}
@@ -6277,8 +6276,7 @@ func testFailingChannel(net *lntest.NetworkHarness, t *harnessTest) {
 
 	// We'll introduce Carol, which will settle any incoming invoice with a
 	// totally unrelated preimage.
-	carol, err := net.NewNode("Carol",
-		[]string{"--debughtlc", "--hodl.bogus-settle"})
+	carol, err := net.NewNode("Carol", []string{"--hodl.bogus-settle"})
 	if err != nil {
 		t.Fatalf("unable to create new nodes: %v", err)
 	}
@@ -6740,7 +6738,7 @@ func testRevokedCloseRetribution(net *lntest.NetworkHarness, t *harnessTest) {
 	// protection logic automatically.
 	carol, err := net.NewNode(
 		"Carol",
-		[]string{"--debughtlc", "--hodl.exit-settle", "--nolisten"},
+		[]string{"--hodl.exit-settle", "--nolisten"},
 	)
 	if err != nil {
 		t.Fatalf("unable to create new carol node: %v", err)
@@ -6992,7 +6990,7 @@ func testRevokedCloseRetributionZeroValueRemoteOutput(net *lntest.NetworkHarness
 
 	// Since we'd like to test some multi-hop failure scenarios, we'll
 	// introduce another node into our test network: Carol.
-	carol, err := net.NewNode("Carol", []string{"--debughtlc", "--hodl.exit-settle"})
+	carol, err := net.NewNode("Carol", []string{"--hodl.exit-settle"})
 	if err != nil {
 		t.Fatalf("unable to create new nodes: %v", err)
 	}
@@ -7003,7 +7001,7 @@ func testRevokedCloseRetributionZeroValueRemoteOutput(net *lntest.NetworkHarness
 	// protection logic automatically.
 	dave, err := net.NewNode(
 		"Dave",
-		[]string{"--debughtlc", "--hodl.exit-settle", "--nolisten"},
+		[]string{"--hodl.exit-settle", "--nolisten"},
 	)
 	if err != nil {
 		t.Fatalf("unable to create new node: %v", err)
@@ -7240,7 +7238,7 @@ func testRevokedCloseRetributionRemoteHodl(net *lntest.NetworkHarness,
 	// Since this test will result in the counterparty being left in a
 	// weird state, we will introduce another node into our test network:
 	// Carol.
-	carol, err := net.NewNode("Carol", []string{"--debughtlc", "--hodl.exit-settle"})
+	carol, err := net.NewNode("Carol", []string{"--hodl.exit-settle"})
 	if err != nil {
 		t.Fatalf("unable to create new nodes: %v", err)
 	}
@@ -7253,7 +7251,7 @@ func testRevokedCloseRetributionRemoteHodl(net *lntest.NetworkHarness,
 	// trigger the channel data protection logic automatically.
 	dave, err := net.NewNode(
 		"Dave",
-		[]string{"--debughtlc", "--hodl.exit-settle", "--nolisten"},
+		[]string{"--hodl.exit-settle", "--nolisten"},
 	)
 	if err != nil {
 		t.Fatalf("unable to create new dave node: %v", err)
@@ -7657,9 +7655,7 @@ func testRevokedCloseRetributionAltruistWatchtower(net *lntest.NetworkHarness,
 
 	// Since we'd like to test some multi-hop failure scenarios, we'll
 	// introduce another node into our test network: Carol.
-	carol, err := net.NewNode("Carol", []string{
-		"--debughtlc", "--hodl.exit-settle",
-	})
+	carol, err := net.NewNode("Carol", []string{"--hodl.exit-settle"})
 	if err != nil {
 		t.Fatalf("unable to create new nodes: %v", err)
 	}
@@ -9854,7 +9850,7 @@ func createThreeHopNetwork(t *harnessTest, net *lntest.NetworkHarness,
 	// Next, we'll create a new node "carol" and have Bob connect to her. If
 	// the carolHodl flag is set, we'll make carol always hold onto the
 	// HTLC, this way it'll force Bob to go to chain to resolve the HTLC.
-	carolFlags := []string{"--debughtlc"}
+	carolFlags := []string{}
 	if carolHodl {
 		carolFlags = append(carolFlags, "--hodl.exit-settle")
 	}
@@ -10694,7 +10690,7 @@ func testSwitchCircuitPersistence(net *lntest.NetworkHarness, t *harnessTest) {
 	// Next, we'll create Carol and establish a channel to from her to
 	// Dave. Carol is started in htlchodl mode so that we can disconnect the
 	// intermediary hops before starting the settle.
-	carol, err := net.NewNode("Carol", []string{"--debughtlc", "--hodl.exit-settle"})
+	carol, err := net.NewNode("Carol", []string{"--hodl.exit-settle"})
 	if err != nil {
 		t.Fatalf("unable to create new nodes: %v", err)
 	}
@@ -11017,7 +11013,7 @@ func testSwitchOfflineDelivery(net *lntest.NetworkHarness, t *harnessTest) {
 	// Next, we'll create Carol and establish a channel to from her to
 	// Dave. Carol is started in htlchodl mode so that we can disconnect the
 	// intermediary hops before starting the settle.
-	carol, err := net.NewNode("Carol", []string{"--debughtlc", "--hodl.exit-settle"})
+	carol, err := net.NewNode("Carol", []string{"--hodl.exit-settle"})
 	if err != nil {
 		t.Fatalf("unable to create new nodes: %v", err)
 	}
@@ -11348,7 +11344,7 @@ func testSwitchOfflineDeliveryPersistence(net *lntest.NetworkHarness, t *harness
 	// Next, we'll create Carol and establish a channel to from her to
 	// Dave. Carol is started in htlchodl mode so that we can disconnect the
 	// intermediary hops before starting the settle.
-	carol, err := net.NewNode("Carol", []string{"--debughtlc", "--hodl.exit-settle"})
+	carol, err := net.NewNode("Carol", []string{"--hodl.exit-settle"})
 	if err != nil {
 		t.Fatalf("unable to create new nodes: %v", err)
 	}
@@ -11684,7 +11680,7 @@ func testSwitchOfflineDeliveryOutgoingOffline(
 	// Next, we'll create Carol and establish a channel to from her to
 	// Dave. Carol is started in htlchodl mode so that we can disconnect the
 	// intermediary hops before starting the settle.
-	carol, err := net.NewNode("Carol", []string{"--debughtlc", "--hodl.exit-settle"})
+	carol, err := net.NewNode("Carol", []string{"--hodl.exit-settle"})
 	if err != nil {
 		t.Fatalf("unable to create new nodes: %v", err)
 	}
