@@ -15,8 +15,8 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
 	"github.com/btcsuite/btcutil/gcs/builder"
-	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/lightninglabs/neutrino"
+	"github.com/lightninglabs/neutrino/headerfs"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/queue"
 )
@@ -116,12 +116,20 @@ func (n *NeutrinoNotifier) Start() error {
 		return nil
 	}
 
+	// Start our concurrent queues before starting the rescan, to ensure
+	// onFilteredBlockConnected and onRelavantTx callbacks won't be
+	// blocked.
+	n.chainUpdates.Start()
+	n.txUpdates.Start()
+
 	// First, we'll obtain the latest block height of the p2p node. We'll
 	// start the auto-rescan from this point. Once a caller actually wishes
 	// to register a chain view, the rescan state will be rewound
 	// accordingly.
 	startingPoint, err := n.p2pNode.BestBlock()
 	if err != nil {
+		n.txUpdates.Stop()
+		n.chainUpdates.Stop()
 		return err
 	}
 	n.bestBlock.Hash = &startingPoint.Hash
@@ -159,9 +167,6 @@ func (n *NeutrinoNotifier) Start() error {
 		rescanOptions...,
 	)
 	n.rescanErr = n.chainView.Start()
-
-	n.chainUpdates.Start()
-	n.txUpdates.Start()
 
 	n.wg.Add(1)
 	go n.notificationDispatcher()
@@ -753,10 +758,10 @@ func (n *NeutrinoNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint,
 
 		spendReport, err := n.p2pNode.GetUtxo(
 			neutrino.WatchInputs(inputToWatch),
-			neutrino.StartBlock(&waddrmgr.BlockStamp{
+			neutrino.StartBlock(&headerfs.BlockStamp{
 				Height: int32(ntfn.HistoricalDispatch.StartHeight),
 			}),
-			neutrino.EndBlock(&waddrmgr.BlockStamp{
+			neutrino.EndBlock(&headerfs.BlockStamp{
 				Height: int32(ntfn.HistoricalDispatch.EndHeight),
 			}),
 			neutrino.QuitChan(n.quit),

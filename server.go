@@ -28,12 +28,14 @@ import (
 	sphinx "github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/autopilot"
 	"github.com/lightningnetwork/lnd/brontide"
+	"github.com/lightningnetwork/lnd/chanacceptor"
 	"github.com/lightningnetwork/lnd/chanbackup"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channelnotifier"
 	"github.com/lightningnetwork/lnd/contractcourt"
 	"github.com/lightningnetwork/lnd/discovery"
 	"github.com/lightningnetwork/lnd/htlcswitch"
+	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lncfg"
@@ -47,6 +49,7 @@ import (
 	"github.com/lightningnetwork/lnd/peernotifier"
 	"github.com/lightningnetwork/lnd/pool"
 	"github.com/lightningnetwork/lnd/routing"
+	"github.com/lightningnetwork/lnd/routing/localchans"
 	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/sweep"
 	"github.com/lightningnetwork/lnd/ticker"
@@ -55,7 +58,6 @@ import (
 	"github.com/lightningnetwork/lnd/watchtower/wtclient"
 	"github.com/lightningnetwork/lnd/watchtower/wtdb"
 	"github.com/lightningnetwork/lnd/watchtower/wtpolicy"
-	"github.com/lightningnetwork/lnd/zpay32"
 )
 
 const (
@@ -203,13 +205,15 @@ type server struct {
 
 	authGossiper *discovery.AuthenticatedGossiper
 
+	localChanMgr *localchans.Manager
+
 	utxoNursery *utxoNursery
 
 	sweeper *sweep.UtxoSweeper
 
 	chainArb *contractcourt.ChainArbitrator
 
-	sphinx *htlcswitch.OnionProcessor
+	sphinx *hop.OnionProcessor
 
 	towerClient wtclient.Client
 
@@ -294,7 +298,8 @@ func noiseDial(idPriv *btcec.PrivateKey) func(net.Addr) (net.Conn, error) {
 func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 	towerClientDB *wtdb.ClientDB, cc *chainControl,
 	privKey *btcec.PrivateKey,
-	chansToRestore walletunlocker.ChannelsToRecover) (*server, error) {
+	chansToRestore walletunlocker.ChannelsToRecover,
+	chanPredicate chanacceptor.ChannelAcceptor) (*server, error) {
 
 	var err error
 
@@ -317,6 +322,12 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 	// we signal our knowledge of the new TLV onion format.
 	if !cfg.LegacyProtocol.LegacyOnion() {
 		globalFeatures.Set(lnwire.TLVOnionPayloadOptional)
+	}
+
+	// Similarly, we default to the new modern commitment format unless the
+	// legacy commitment config is set to true.
+	if !cfg.LegacyProtocol.LegacyCommitment() {
+		globalFeatures.Set(lnwire.StaticRemoteKeyOptional)
 	}
 
 	var serializedPubKey [33]byte
@@ -347,14 +358,6 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 		readBufferPool, cfg.Workers.Read, pool.DefaultWorkerTimeout,
 	)
 
-	decodeFinalCltvExpiry := func(payReq string) (uint32, error) {
-		invoice, err := zpay32.Decode(payReq, activeNetParams.Params)
-		if err != nil {
-			return 0, err
-		}
-		return uint32(invoice.MinFinalCLTVExpiry()), nil
-	}
-
 	s := &server{
 		chanDB:         chanDB,
 		cc:             cc,
@@ -364,8 +367,7 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 		chansToRestore: chansToRestore,
 
 		invoices: invoices.NewRegistry(
-			chanDB, decodeFinalCltvExpiry,
-			defaultFinalCltvRejectDelta,
+			chanDB, defaultFinalCltvRejectDelta,
 		),
 
 		channelNotifier: channelnotifier.New(chanDB),
@@ -377,7 +379,7 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 
 		// TODO(roasbeef): derive proper onion key based on rotation
 		// schedule
-		sphinx: htlcswitch.NewOnionProcessor(sphinxRouter),
+		sphinx: hop.NewOnionProcessor(sphinxRouter),
 
 		persistentPeers:         make(map[string]struct{}),
 		persistentPeersBackoff:  make(map[string]time.Duration),
@@ -392,8 +394,9 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 		peerConnectedListeners:    make(map[string][]chan<- lnpeer.Peer),
 		peerDisconnectedListeners: make(map[string][]chan<- struct{}),
 
-		globalFeatures: lnwire.NewFeatureVector(globalFeatures,
-			lnwire.GlobalFeatures),
+		globalFeatures: lnwire.NewFeatureVector(
+			globalFeatures, lnwire.GlobalFeatures,
+		),
 		quit: make(chan struct{}),
 	}
 
@@ -439,8 +442,6 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 		FwdEventTicker:         ticker.New(htlcswitch.DefaultFwdEventInterval),
 		LogEventTicker:         ticker.New(htlcswitch.DefaultLogInterval),
 		AckEventTicker:         ticker.New(htlcswitch.DefaultAckInterval),
-		NotifyActiveChannel:    s.channelNotifier.NotifyActiveChannelEvent,
-		NotifyInactiveChannel:  s.channelNotifier.NotifyInactiveChannelEvent,
 		RejectHTLC:             cfg.RejectHTLC,
 	}, uint32(currentHeight))
 	if err != nil {
@@ -719,16 +720,20 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 	}
 
 	s.authGossiper = discovery.New(discovery.Config{
-		Router:                  s.chanRouter,
-		Notifier:                s.cc.chainNotifier,
-		ChainHash:               *activeNetParams.GenesisHash,
-		Broadcast:               s.BroadcastMessage,
-		ChanSeries:              chanSeries,
-		NotifyWhenOnline:        s.NotifyWhenOnline,
-		NotifyWhenOffline:       s.NotifyWhenOffline,
+		Router:            s.chanRouter,
+		Notifier:          s.cc.chainNotifier,
+		ChainHash:         *activeNetParams.GenesisHash,
+		Broadcast:         s.BroadcastMessage,
+		ChanSeries:        chanSeries,
+		NotifyWhenOnline:  s.NotifyWhenOnline,
+		NotifyWhenOffline: s.NotifyWhenOffline,
+		SelfNodeAnnouncement: func(refresh bool) (lnwire.NodeAnnouncement, error) {
+			return s.genNodeAnnouncement(refresh)
+		},
 		ProofMatureDelta:        0,
 		TrickleDelay:            time.Millisecond * time.Duration(cfg.TrickleDelay),
-		RetransmitDelay:         time.Minute * 30,
+		RetransmitTicker:        ticker.New(time.Minute * 30),
+		RebroadcastInterval:     time.Hour * 24,
 		WaitingProofStore:       waitingProofStore,
 		MessageStore:            gossipMessageStore,
 		AnnSigner:               s.nodeSigner,
@@ -741,6 +746,13 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 	},
 		s.identityPriv.PubKey(),
 	)
+
+	s.localChanMgr = &localchans.Manager{
+		ForAllOutgoingChannels:    s.chanRouter.ForAllOutgoingChannels,
+		PropagateChanPolicyUpdate: s.authGossiper.PropagateChanPolicyUpdate,
+		UpdateForwardingPolicies:  s.htlcSwitch.UpdateForwardingPolicies,
+		FetchChannel:              s.chanDB.FetchChannel,
+	}
 
 	utxnStore, err := newNurseryStore(activeNetParams.GenesisHash, chanDB)
 	if err != nil {
@@ -905,6 +917,7 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 	if _, err := rand.Read(chanIDSeed[:]); err != nil {
 		return nil, err
 	}
+
 	s.fundingMgr, err = newFundingManager(fundingConfig{
 		IDKey:              privKey.PubKey(),
 		Wallet:             cc.wallet,
@@ -1066,6 +1079,7 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 		MaxPendingChannels:     cfg.MaxPendingChannels,
 		RejectPush:             cfg.RejectPush,
 		NotifyOpenChannelEvent: s.channelNotifier.NotifyOpenChannelEvent,
+		OpenChannelPredicate:   chanPredicate,
 	})
 	if err != nil {
 		return nil, err

@@ -1,5 +1,6 @@
 PKG := github.com/lightningnetwork/lnd
 ESCPKG := github.com\/lightningnetwork\/lnd
+MOBILE_PKG := $(PKG)/mobile
 
 BTCD_PKG := github.com/btcsuite/btcd
 GOVERALLS_PKG := github.com/mattn/goveralls
@@ -8,11 +9,17 @@ GOACC_PKG := github.com/ory/go-acc
 
 GO_BIN := ${GOPATH}/bin
 BTCD_BIN := $(GO_BIN)/btcd
+GOMOBILE_BIN := GO111MODULE=off $(GO_BIN)/gomobile
 GOVERALLS_BIN := $(GO_BIN)/goveralls
 LINT_BIN := $(GO_BIN)/golangci-lint
 GOACC_BIN := $(GO_BIN)/go-acc
 
 BTCD_DIR :=${GOPATH}/src/$(BTCD_PKG)
+MOBILE_BUILD_DIR :=${GOPATH}/src/$(MOBILE_PKG)/build
+IOS_BUILD_DIR := $(MOBILE_BUILD_DIR)/ios
+IOS_BUILD := $(IOS_BUILD_DIR)/Lndmobile.framework
+ANDROID_BUILD_DIR := $(MOBILE_BUILD_DIR)/android
+ANDROID_BUILD := $(ANDROID_BUILD_DIR)/Lndmobile.aar
 
 COMMIT := $(shell git describe --abbrev=40 --dirty)
 LDFLAGS := -ldflags "-X $(PKG)/build.Commit=$(COMMIT)"
@@ -23,8 +30,10 @@ BTCD_COMMIT := $(shell cat go.mod | \
 		awk -F " " '{ print $$2 }' | \
 		awk -F "/" '{ print $$1 }')
 
+LINT_COMMIT := v1.18.0
 GOACC_COMMIT := ddc355013f90fea78d83d3a6c71f1d37ac07ecd5
 
+DEPGET := cd /tmp && GO111MODULE=on go get -v
 GOBUILD := GO111MODULE=on go build -v
 GOINSTALL := GO111MODULE=on go install -v
 GOTEST := GO111MODULE=on go test -v
@@ -42,7 +51,7 @@ include make/testing_flags.mk
 
 DEV_TAGS := $(if ${tags},$(DEV_TAGS) ${tags},$(DEV_TAGS))
 
-LINT = $(LINT_BIN) run
+LINT = $(LINT_BIN) run -v
 
 GREEN := "\\033[0;32m"
 NC := "\\033[0m"
@@ -64,37 +73,37 @@ $(GOVERALLS_BIN):
 
 $(LINT_BIN):
 	@$(call print, "Fetching linter")
-	GO111MODULE=off go get -u $(LINT_PKG)
+	$(DEPGET) $(LINT_PKG)@$(LINT_COMMIT)
 
 $(GOACC_BIN):
 	@$(call print, "Fetching go-acc")
-	go get -u -v $(GOACC_PKG)@$(GOACC_COMMIT)
-	$(GOINSTALL) $(GOACC_PKG)
+	$(DEPGET) $(GOACC_PKG)@$(GOACC_COMMIT)
 
 btcd:
 	@$(call print, "Installing btcd.")
-	GO111MODULE=on go get -v $(BTCD_PKG)@$(BTCD_COMMIT)
-	$(GOINSTALL) $(BTCD_PKG)
-	$(GOINSTALL) $(BTCD_PKG)/cmd/btcctl
+	$(DEPGET) $(BTCD_PKG)@$(BTCD_COMMIT)
 
 # ============
 # INSTALLATION
 # ============
 
 build:
-	@$(call print, "Building debug lnd and lncli.")
+	@$(call print, "Building debug lnd/lncli and lnwallet.")
 	$(GOBUILD) -tags="$(DEV_TAGS)" -o lnd-debug $(LDFLAGS) $(PKG)/cmd/lnd
 	$(GOBUILD) -tags="$(DEV_TAGS)" -o lncli-debug $(LDFLAGS) $(PKG)/cmd/lncli
+	$(GOBUILD) -tags="$(DEV_TAGS)" -o lnwallet-debug $(LDFLAGS) $(PKG)/cmd/lnwallet
 
 build-itest:
 	@$(call print, "Building itest lnd and lncli.")
 	$(GOBUILD) -tags="$(ITEST_TAGS)" -o lnd-itest $(LDFLAGS) $(PKG)/cmd/lnd
 	$(GOBUILD) -tags="$(ITEST_TAGS)" -o lncli-itest $(LDFLAGS) $(PKG)/cmd/lncli
+	$(GOBUILD) -tags="$(ITEST_TAGS)" -o lnwallet-itest $(LDFLAGS) $(PKG)/cmd/lnwallet
 
 install:
-	@$(call print, "Installing lnd and lncli.")
+	@$(call print, "Installing lnd/lncli and lnwallet.")
 	$(GOINSTALL) -tags="${tags}" $(LDFLAGS) $(PKG)/cmd/lnd
 	$(GOINSTALL) -tags="${tags}" $(LDFLAGS) $(PKG)/cmd/lncli
+	$(GOINSTALL) -tags="${tags}" $(LDFLAGS) $(PKG)/cmd/lnwallet
 
 scratch: build
 
@@ -170,10 +179,30 @@ rpc:
 	@$(call print, "Compiling protos.")
 	cd ./lnrpc; ./gen_protos.sh
 
+mobile-rpc:
+	@$(call print, "Creating mobile RPC from protos.")
+	cd ./mobile; ./gen_bindings.sh
+
+vendor:
+	@$(call print, "Re-creating vendor directory.")
+	rm -r vendor/; GO111MODULE=on go mod vendor
+
+ios: vendor mobile-rpc
+	@$(call print, "Building iOS framework ($(IOS_BUILD)).")
+	mkdir -p $(IOS_BUILD_DIR)
+	$(GOMOBILE_BIN) bind -target=ios -tags="ios $(DEV_TAGS) autopilotrpc experimental" $(LDFLAGS) -v -o $(IOS_BUILD) $(MOBILE_PKG)
+
+android: vendor mobile-rpc
+	@$(call print, "Building Android library ($(ANDROID_BUILD)).")
+	mkdir -p $(ANDROID_BUILD_DIR)
+	$(GOMOBILE_BIN) bind -target=android -tags="android $(DEV_TAGS) autopilotrpc experimental" $(LDFLAGS) -v -o $(ANDROID_BUILD) $(MOBILE_PKG)
+
+mobile: ios android
+
 clean:
 	@$(call print, "Cleaning source.$(NC)")
-	$(RM) ./lnd-debug ./lncli-debug
-	$(RM) ./lnd-itest ./lncli-itest
+	$(RM) ./lnd-debug ./lncli-debug ./lnwallet-debug
+	$(RM) ./lnd-itest ./lncli-itest ./lnwallet-itest
 	$(RM) -r ./vendor .vendor-new
 
 
@@ -199,4 +228,9 @@ clean:
 	lint \
 	list \
 	rpc \
+	mobile-rpc \
+	vendor \
+	ios \
+	android \
+	mobile \
 	clean

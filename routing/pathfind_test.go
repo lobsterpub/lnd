@@ -324,21 +324,6 @@ type testChannelEnd struct {
 	*testChannelPolicy
 }
 
-func defaultTestChannelEnd(alias string, capacity btcutil.Amount) *testChannelEnd {
-	return &testChannelEnd{
-		Alias: alias,
-		testChannelPolicy: &testChannelPolicy{
-			Expiry:      144,
-			MinHTLC:     lnwire.MilliSatoshi(1000),
-			MaxHTLC:     lnwire.NewMSatFromSatoshis(capacity),
-			FeeBaseMsat: lnwire.MilliSatoshi(1000),
-			FeeRate:     lnwire.MilliSatoshi(1),
-			LastUpdate:  testTime,
-			Disabled:    false,
-		},
-	}
-}
-
 func symmetricTestChannel(alias1 string, alias2 string, capacity btcutil.Amount,
 	policy *testChannelPolicy, chanID ...uint64) *testChannel {
 
@@ -1436,6 +1421,9 @@ func TestRouteFailMaxHTLC(t *testing.T) {
 	// Next, update the middle edge policy to only allow payments up to 100k
 	// msat.
 	_, midEdge, _, err := graph.graph.FetchChannelEdgesByID(firstToSecondID)
+	if err != nil {
+		t.Fatalf("unable to fetch channel edges by ID: %v", err)
+	}
 	midEdge.MessageFlags = 1
 	midEdge.MaxHTLC = payAmt - 1
 	if err := graph.graph.UpdateEdgePolicy(midEdge); err != nil {
@@ -1674,13 +1662,6 @@ func TestPathFindSpecExample(t *testing.T) {
 		t.Fatalf("unable to create router: %v", err)
 	}
 	defer cleanUp()
-
-	const (
-		aliceFinalCLTV = 10
-		bobFinalCLTV   = 20
-		carolFinalCLTV = 30
-		daveFinalCLTV  = 40
-	)
 
 	// We'll first exercise the scenario of a direct payment from Bob to
 	// Carol, so we set "B" as the source node so path finding starts from

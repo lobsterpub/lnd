@@ -2,8 +2,8 @@ package channeldb
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
-	"math/rand"
 	"reflect"
 	"testing"
 	"time"
@@ -11,7 +11,6 @@ import (
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/lntypes"
-	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/tlv"
 )
@@ -52,34 +51,6 @@ var (
 	}
 )
 
-func makeFakePayment() *outgoingPayment {
-	fakeInvoice := &Invoice{
-		// Use single second precision to avoid false positive test
-		// failures due to the monotonic time component.
-		CreationDate:   time.Unix(time.Now().Unix(), 0),
-		Memo:           []byte("fake memo"),
-		Receipt:        []byte("fake receipt"),
-		PaymentRequest: []byte(""),
-	}
-
-	copy(fakeInvoice.Terms.PaymentPreimage[:], rev[:])
-	fakeInvoice.Terms.Value = lnwire.NewMSatFromSatoshis(10000)
-
-	fakePath := make([][33]byte, 3)
-	for i := 0; i < 3; i++ {
-		copy(fakePath[i][:], bytes.Repeat([]byte{byte(i)}, 33))
-	}
-
-	fakePayment := &outgoingPayment{
-		Invoice:        *fakeInvoice,
-		Fee:            101,
-		Path:           fakePath,
-		TimeLockLength: 1000,
-	}
-	copy(fakePayment.PaymentPreimage[:], rev[:])
-	return fakePayment
-}
-
 func makeFakeInfo() (*PaymentCreationInfo, *PaymentAttemptInfo) {
 	var preimg lntypes.Preimage
 	copy(preimg[:], rev[:])
@@ -99,78 +70,6 @@ func makeFakeInfo() (*PaymentCreationInfo, *PaymentAttemptInfo) {
 		Route:      testRoute,
 	}
 	return c, a
-}
-
-func makeFakePaymentHash() [32]byte {
-	var paymentHash [32]byte
-	rBytes, _ := randomBytes(0, 32)
-	copy(paymentHash[:], rBytes)
-
-	return paymentHash
-}
-
-// randomBytes creates random []byte with length in range [minLen, maxLen)
-func randomBytes(minLen, maxLen int) ([]byte, error) {
-	randBuf := make([]byte, minLen+rand.Intn(maxLen-minLen))
-
-	if _, err := rand.Read(randBuf); err != nil {
-		return nil, fmt.Errorf("Internal error. "+
-			"Cannot generate random string: %v", err)
-	}
-
-	return randBuf, nil
-}
-
-func makeRandomFakePayment() (*outgoingPayment, error) {
-	var err error
-	fakeInvoice := &Invoice{
-		// Use single second precision to avoid false positive test
-		// failures due to the monotonic time component.
-		CreationDate: time.Unix(time.Now().Unix(), 0),
-	}
-
-	fakeInvoice.Memo, err = randomBytes(1, 50)
-	if err != nil {
-		return nil, err
-	}
-
-	fakeInvoice.Receipt, err = randomBytes(1, 50)
-	if err != nil {
-		return nil, err
-	}
-
-	fakeInvoice.PaymentRequest, err = randomBytes(1, 50)
-	if err != nil {
-		return nil, err
-	}
-
-	preImg, err := randomBytes(32, 33)
-	if err != nil {
-		return nil, err
-	}
-	copy(fakeInvoice.Terms.PaymentPreimage[:], preImg)
-
-	fakeInvoice.Terms.Value = lnwire.MilliSatoshi(rand.Intn(10000))
-
-	fakePathLen := 1 + rand.Intn(5)
-	fakePath := make([][33]byte, fakePathLen)
-	for i := 0; i < fakePathLen; i++ {
-		b, err := randomBytes(33, 34)
-		if err != nil {
-			return nil, err
-		}
-		copy(fakePath[i][:], b)
-	}
-
-	fakePayment := &outgoingPayment{
-		Invoice:        *fakeInvoice,
-		Fee:            lnwire.MilliSatoshi(rand.Intn(1001)),
-		Path:           fakePath,
-		TimeLockLength: uint32(rand.Intn(10000)),
-	}
-	copy(fakePayment.PaymentPreimage[:], fakeInvoice.Terms.PaymentPreimage[:])
-
-	return fakePayment, nil
 }
 
 func TestSentPaymentSerialization(t *testing.T) {
@@ -207,14 +106,15 @@ func TestSentPaymentSerialization(t *testing.T) {
 
 	// First we verify all the records match up porperly, as they aren't
 	// able to be properly compared using reflect.DeepEqual.
-	assertRouteHopRecordsEqual(&s.Route, &newAttemptInfo.Route)
+	err = assertRouteEqual(&s.Route, &newAttemptInfo.Route)
+	if err != nil {
+		t.Fatalf("Routes do not match after "+
+			"serialization/deserialization: %v", err)
+	}
 
-	// With the hop recrods, equal, we'll now blank them out as
-	// reflect.DeepEqual can't properly compare tlv.Record instances.
-	newAttemptInfo.Route.Hops[0].TLVRecords = nil
-	newAttemptInfo.Route.Hops[1].TLVRecords = nil
-	s.Route.Hops[0].TLVRecords = nil
-	s.Route.Hops[1].TLVRecords = nil
+	// Clear routes to allow DeepEqual to compare the remaining fields.
+	newAttemptInfo.Route = route.Route{}
+	s.Route = route.Route{}
 
 	if !reflect.DeepEqual(s, newAttemptInfo) {
 		s.SessionKey.Curve = nil
@@ -224,14 +124,53 @@ func TestSentPaymentSerialization(t *testing.T) {
 			spew.Sdump(s), spew.Sdump(newAttemptInfo),
 		)
 	}
+}
 
+// assertRouteEquals compares to routes for equality and returns an error if
+// they are not equal.
+func assertRouteEqual(a, b *route.Route) error {
+	err := assertRouteHopRecordsEqual(a, b)
+	if err != nil {
+		return err
+	}
+
+	// TLV records have already been compared and need to be cleared to
+	// properly compare the remaining fields using DeepEqual.
+	copyRouteNoHops := func(r *route.Route) *route.Route {
+		copy := *r
+		copy.Hops = make([]*route.Hop, len(r.Hops))
+		for i, hop := range r.Hops {
+			hopCopy := *hop
+			hopCopy.TLVRecords = nil
+			copy.Hops[i] = &hopCopy
+		}
+		return &copy
+	}
+
+	if !reflect.DeepEqual(copyRouteNoHops(a), copyRouteNoHops(b)) {
+		return fmt.Errorf("PaymentAttemptInfos don't match: %v vs %v",
+			spew.Sdump(a), spew.Sdump(b))
+	}
+
+	return nil
 }
 
 func assertRouteHopRecordsEqual(r1, r2 *route.Route) error {
+	if len(r1.Hops) != len(r2.Hops) {
+		return errors.New("route hop count mismatch")
+	}
+
 	for i := 0; i < len(r1.Hops); i++ {
-		for j := 0; j < len(r1.Hops[i].TLVRecords); j++ {
-			expectedRecord := r1.Hops[i].TLVRecords[j]
-			newRecord := r2.Hops[i].TLVRecords[j]
+		records1 := r1.Hops[i].TLVRecords
+		records2 := r2.Hops[i].TLVRecords
+		if len(records1) != len(records2) {
+			return fmt.Errorf("route record count for hop %v "+
+				"mismatch", i)
+		}
+
+		for j := 0; j < len(records1); j++ {
+			expectedRecord := records1[j]
+			newRecord := records2[j]
 
 			err := assertHopRecordsEqual(expectedRecord, newRecord)
 			if err != nil {
@@ -283,20 +222,8 @@ func TestRouteSerialization(t *testing.T) {
 
 	// First we verify all the records match up porperly, as they aren't
 	// able to be properly compared using reflect.DeepEqual.
-	err = assertRouteHopRecordsEqual(&testRoute, &route2)
+	err = assertRouteEqual(&testRoute, &route2)
 	if err != nil {
-		t.Fatalf("route tlv records don't match: %v", err)
-	}
-
-	// Now that we know the records match up, we'll examine the remainder
-	// of the route without the TLV records attached as reflect.DeepEqual
-	// can't properly assert their equality.
-	testRoute.Hops[0].TLVRecords = nil
-	testRoute.Hops[1].TLVRecords = nil
-	route2.Hops[0].TLVRecords = nil
-	route2.Hops[1].TLVRecords = nil
-
-	if !reflect.DeepEqual(testRoute, route2) {
 		t.Fatalf("routes not equal: \n%v vs \n%v",
 			spew.Sdump(testRoute), spew.Sdump(route2))
 	}

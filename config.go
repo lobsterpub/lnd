@@ -232,7 +232,7 @@ type config struct {
 	ShowVersion bool `short:"V" long:"version" description:"Display version information and exit"`
 
 	LndDir          string   `long:"lnddir" description:"The base directory that contains lnd's data, logs, configuration file, etc."`
-	ConfigFile      string   `long:"C" long:"configfile" description:"Path to configuration file"`
+	ConfigFile      string   `short:"C" long:"configfile" description:"Path to configuration file"`
 	DataDir         string   `short:"b" long:"datadir" description:"The directory to store lnd's data within"`
 	TLSCertPath     string   `long:"tlscertpath" description:"Path to write the TLS certificate for lnd's RPC and REST services"`
 	TLSKeyPath      string   `long:"tlskeypath" description:"Path to write the TLS private key for lnd's RPC and REST services"`
@@ -259,6 +259,7 @@ type config struct {
 	Listeners        []net.Addr
 	ExternalIPs      []net.Addr
 	DisableListen    bool          `long:"nolisten" description:"Disable listening for incoming peer connections"`
+	DisableRest      bool          `long:"norest" description:"Disable REST API"`
 	NAT              bool          `long:"nat" description:"Toggle NAT traversal support (using either UPnP or NAT-PMP) to automatically advertise your external IP address to the network -- NOTE this does not support devices behind multiple NATs"`
 	MinBackoff       time.Duration `long:"minbackoff" description:"Shortest backoff when reconnecting to persistent peers. Valid time units are {s, m, h}."`
 	MaxBackoff       time.Duration `long:"maxbackoff" description:"Longest backoff when reconnecting to persistent peers. Valid time units are {s, m, h}."`
@@ -316,6 +317,8 @@ type config struct {
 	StaggerInitialReconnect bool `long:"stagger-initial-reconnect" description:"If true, will apply a randomized staggering between 0s and 30s when reconnecting to persistent peers on startup. The first 10 reconnections will be attempted instantly, regardless of the flag's value"`
 
 	MaxOutgoingCltvExpiry uint32 `long:"max-cltv-expiry" description:"The maximum number of blocks funds could be locked up for when forwarding payments."`
+
+	MaxChannelFeeAllocation float64 `long:"max-channel-fee-allocation" description:"The maximum percentage of total funds that can be allocated to a channel's commitment fee. This only applies for the initiator of the channel. Valid values are within [0.1, 1]."`
 
 	net tor.Net
 
@@ -432,7 +435,8 @@ func loadConfig() (*config, error) {
 		Watchtower: &lncfg.Watchtower{
 			TowerDir: defaultTowerDir,
 		},
-		MaxOutgoingCltvExpiry: htlcswitch.DefaultMaxOutgoingCltvExpiry,
+		MaxOutgoingCltvExpiry:   htlcswitch.DefaultMaxOutgoingCltvExpiry,
+		MaxChannelFeeAllocation: htlcswitch.DefaultMaxLinkFeeAllocation,
 	}
 
 	// Pre-parse the command line options to pick up an alternative config
@@ -589,6 +593,13 @@ func loadConfig() (*config, error) {
 
 	if _, err := validateAtplCfg(cfg.Autopilot); err != nil {
 		return nil, err
+	}
+
+	// Ensure a valid max channel fee allocation was set.
+	if cfg.MaxChannelFeeAllocation <= 0 || cfg.MaxChannelFeeAllocation > 1 {
+		return nil, fmt.Errorf("invalid max channel fee allocation: "+
+			"%v, must be within (0, 1]",
+			cfg.MaxChannelFeeAllocation)
 	}
 
 	// Validate the Tor config parameters.
@@ -799,13 +810,6 @@ func loadConfig() (*config, error) {
 			str := "%s: either --bitcoin.mainnet, or " +
 				"bitcoin.testnet, bitcoin.simnet, or bitcoin.regtest " +
 				"must be specified"
-			err := fmt.Errorf(str, funcName)
-			return nil, err
-		}
-
-		if cfg.Bitcoin.Node == "neutrino" && cfg.Bitcoin.MainNet {
-			str := "%s: neutrino isn't yet supported for " +
-				"bitcoin's mainnet"
 			err := fmt.Errorf(str, funcName)
 			return nil, err
 		}
@@ -1021,11 +1025,17 @@ func loadConfig() (*config, error) {
 	if err != nil {
 		return nil, err
 	}
-	err = lncfg.EnforceSafeAuthentication(
-		cfg.RESTListeners, !cfg.NoMacaroons,
-	)
-	if err != nil {
-		return nil, err
+
+	if cfg.DisableRest {
+		ltndLog.Infof("REST API is disabled!")
+		cfg.RESTListeners = nil
+	} else {
+		err = lncfg.EnforceSafeAuthentication(
+			cfg.RESTListeners, !cfg.NoMacaroons,
+		)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Remove the listening addresses specified if listening is disabled.
@@ -1491,7 +1501,7 @@ func extractBitcoindRPCParams(bitcoindConfigPath string) (string, string, string
 // ZMQ rawblock and rawtx notifications are different.
 func checkZMQOptions(zmqBlockHost, zmqTxHost string) error {
 	if zmqBlockHost == zmqTxHost {
-		return errors.New("zmqpubrawblock and zmqpubrawtx must be set" +
+		return errors.New("zmqpubrawblock and zmqpubrawtx must be set " +
 			"to different addresses")
 	}
 
