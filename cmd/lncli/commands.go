@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
@@ -22,10 +24,10 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
+	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/walletunlocker"
 	"github.com/urfave/cli"
 	"golang.org/x/crypto/ssh/terminal"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -2025,7 +2027,7 @@ func closedChannels(ctx *cli.Context) error {
 		LocalForce:      ctx.Bool("local_force"),
 		RemoteForce:     ctx.Bool("remote_force"),
 		Breach:          ctx.Bool("breach"),
-		FundingCanceled: ctx.Bool("funding_cancelled"),
+		FundingCanceled: ctx.Bool("funding_canceled"),
 		Abandoned:       ctx.Bool("abandoned"),
 	}
 
@@ -2039,11 +2041,18 @@ func closedChannels(ctx *cli.Context) error {
 	return nil
 }
 
-var cltvLimitFlag = cli.UintFlag{
-	Name: "cltv_limit",
-	Usage: "the maximum time lock that may be used for " +
-		"this payment",
-}
+var (
+	cltvLimitFlag = cli.UintFlag{
+		Name: "cltv_limit",
+		Usage: "the maximum time lock that may be used for " +
+			"this payment",
+	}
+
+	lastHopFlag = cli.StringFlag{
+		Name:  "last_hop",
+		Usage: "pubkey of the last hop to use for this payment",
+	}
+)
 
 // paymentFlags returns common flags for sendpayment and payinvoice.
 func paymentFlags() []cli.Flag {
@@ -2064,6 +2073,7 @@ func paymentFlags() []cli.Flag {
 				"payment",
 		},
 		cltvLimitFlag,
+		lastHopFlag,
 		cli.Uint64Flag{
 			Name: "outgoing_chan_id",
 			Usage: "short channel id of the outgoing channel to " +
@@ -2280,6 +2290,16 @@ func sendPaymentRequest(ctx *cli.Context, req *lnrpc.SendRequest) error {
 	req.FeeLimit = feeLimit
 
 	req.OutgoingChanId = ctx.Uint64("outgoing_chan_id")
+	if ctx.IsSet(lastHopFlag.Name) {
+		lastHop, err := route.NewVertexFromStr(
+			ctx.String(lastHopFlag.Name),
+		)
+		if err != nil {
+			return err
+		}
+		req.LastHopPubkey = lastHop[:]
+	}
+
 	req.CltvLimit = uint32(ctx.Int(cltvLimitFlag.Name))
 
 	amt := req.Amt
@@ -2561,10 +2581,6 @@ var addInvoiceCommand = cli.Command{
 				"with the invoice (default=\"\")",
 		},
 		cli.StringFlag{
-			Name:  "receipt",
-			Usage: "an optional cryptographic receipt of payment",
-		},
-		cli.StringFlag{
 			Name: "preimage",
 			Usage: "the hex-encoded preimage (32 byte) which will " +
 				"allow settling an incoming HTLC payable to this " +
@@ -2608,7 +2624,6 @@ func addInvoice(ctx *cli.Context) error {
 	var (
 		preimage []byte
 		descHash []byte
-		receipt  []byte
 		amt      int64
 		err      error
 	)
@@ -2645,14 +2660,8 @@ func addInvoice(ctx *cli.Context) error {
 		return fmt.Errorf("unable to parse description_hash: %v", err)
 	}
 
-	receipt, err = hex.DecodeString(ctx.String("receipt"))
-	if err != nil {
-		return fmt.Errorf("unable to parse receipt: %v", err)
-	}
-
 	invoice := &lnrpc.Invoice{
 		Memo:            ctx.String("memo"),
-		Receipt:         receipt,
 		RPreimage:       preimage,
 		Value:           amt,
 		DescriptionHash: descHash,
@@ -3000,6 +3009,7 @@ var queryRoutesCommand = cli.Command{
 			Name:  "use_mc",
 			Usage: "use mission control probabilities",
 		},
+		cltvLimitFlag,
 	},
 	Action: actionDecorator(queryRoutes),
 }
@@ -3050,6 +3060,7 @@ func queryRoutes(ctx *cli.Context) error {
 		FeeLimit:          feeLimit,
 		FinalCltvDelta:    int32(ctx.Int("final_cltv_delta")),
 		UseMissionControl: ctx.Bool("use_mc"),
+		CltvLimit:         uint32(ctx.Uint64(cltvLimitFlag.Name)),
 	}
 
 	route, err := client.QueryRoutes(ctxb, req)
@@ -3582,6 +3593,9 @@ func forwardingHistory(ctx *cli.Context) error {
 			return fmt.Errorf("unable to decode start_time %v", err)
 		}
 		args = args.Tail()
+	default:
+		now := time.Now()
+		startTime = uint64(now.Add(-time.Hour * 24).Unix())
 	}
 
 	switch {

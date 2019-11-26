@@ -1459,9 +1459,7 @@ func (d *AuthenticatedGossiper) addNode(msg *lnwire.NodeAnnouncement) error {
 	}
 
 	timestamp := time.Unix(int64(msg.Timestamp), 0)
-	features := lnwire.NewFeatureVector(
-		msg.Features, lnwire.GlobalFeatures,
-	)
+	features := lnwire.NewFeatureVector(msg.Features, lnwire.Features)
 	node := &channeldb.LightningNode{
 		HaveNodeAnnouncement: true,
 		LastUpdate:           timestamp,
@@ -2092,7 +2090,7 @@ func (d *AuthenticatedGossiper) processNetworkAnnouncement(
 			}
 
 			log.Infof("Orphan %v proof announcement with "+
-				"short_chan_id=%v, adding"+
+				"short_chan_id=%v, adding "+
 				"to waiting batch", prefix, shortChanID)
 			nMsg.err <- nil
 			return nil

@@ -129,13 +129,31 @@ type ChannelArbitratorConfig struct {
 	ChainArbitratorConfig
 }
 
+// ReportOutputType describes the type of output that is being reported
+// on.
+type ReportOutputType uint8
+
+const (
+	// ReportOutputIncomingHtlc is an incoming hash time locked contract on
+	// the commitment tx.
+	ReportOutputIncomingHtlc ReportOutputType = iota
+
+	// ReportOutputOutgoingHtlc is an outgoing hash time locked contract on
+	// the commitment tx.
+	ReportOutputOutgoingHtlc
+
+	// ReportOutputUnencumbered is an uncontested output on the commitment
+	// transaction paying to us directly.
+	ReportOutputUnencumbered
+)
+
 // ContractReport provides a summary of a commitment tx output.
 type ContractReport struct {
 	// Outpoint is the final output that will be swept back to the wallet.
 	Outpoint wire.OutPoint
 
-	// Incoming indicates whether the htlc was incoming to this channel.
-	Incoming bool
+	// Type indicates the type of the reported output.
+	Type ReportOutputType
 
 	// Amount is the final value that will be swept in back to the wallet.
 	Amount btcutil.Amount
@@ -426,8 +444,7 @@ func (c *ChannelArbitrator) Start() error {
 		// receive a chain event from the chain watcher than the
 		// commitment has been confirmed on chain, and before we
 		// advance our state step, we call InsertConfirmedCommitSet.
-		confCommitSet := commitSet.HtlcSets[*commitSet.ConfCommitKey]
-		if err := c.relaunchResolvers(confCommitSet); err != nil {
+		if err := c.relaunchResolvers(commitSet); err != nil {
 			c.cfg.BlockEpochs.Cancel()
 			return err
 		}
@@ -443,10 +460,10 @@ func (c *ChannelArbitrator) Start() error {
 // starting the ChannelArbitrator. This information should ideally be stored in
 // the database, so this only serves as a intermediate work-around to prevent a
 // migration.
-func (c *ChannelArbitrator) relaunchResolvers(confirmedHTLCs []channeldb.HTLC) error {
-	// We'll now query our log to see if there are any active
-	// unresolved contracts. If this is the case, then we'll
-	// relaunch all contract resolvers.
+func (c *ChannelArbitrator) relaunchResolvers(commitSet *CommitSet) error {
+	// We'll now query our log to see if there are any active unresolved
+	// contracts. If this is the case, then we'll relaunch all contract
+	// resolvers.
 	unresolvedContracts, err := c.log.FetchUnresolvedContracts()
 	if err != nil {
 		return err
@@ -460,6 +477,27 @@ func (c *ChannelArbitrator) relaunchResolvers(confirmedHTLCs []channeldb.HTLC) e
 		return err
 	}
 	commitHash := contractResolutions.CommitHash
+
+	// In prior versions of lnd, the information needed to supplement the
+	// resolvers (in most cases, the full amount of the HTLC) was found in
+	// the chain action map, which is now deprecated.  As a result, if the
+	// commitSet is nil (an older node with unresolved HTLCs at time of
+	// upgrade), then we'll use the chain action information in place. The
+	// chain actions may exclude some information, but we cannot recover it
+	// for these older nodes at the moment.
+	var confirmedHTLCs []channeldb.HTLC
+	if commitSet != nil {
+		confirmedHTLCs = commitSet.HtlcSets[*commitSet.ConfCommitKey]
+	} else {
+		chainActions, err := c.log.FetchChainActions()
+		if err != nil {
+			log.Errorf("unable to fetch chain actions: %v", err)
+			return err
+		}
+		for _, htlcs := range chainActions {
+			confirmedHTLCs = append(confirmedHTLCs, htlcs...)
+		}
+	}
 
 	// Reconstruct the htlc outpoints and data from the chain action log.
 	// The purpose of the constructed htlc map is to supplement to
@@ -481,96 +519,24 @@ func (c *ChannelArbitrator) relaunchResolvers(confirmedHTLCs []channeldb.HTLC) e
 		"resolvers", c.cfg.ChanPoint, len(unresolvedContracts))
 
 	for _, resolver := range unresolvedContracts {
-		if err := c.supplementResolver(resolver, htlcMap); err != nil {
-			return err
+		htlcResolver, ok := resolver.(htlcContractResolver)
+		if !ok {
+			continue
 		}
+
+		htlcPoint := htlcResolver.HtlcPoint()
+		htlc, ok := htlcMap[htlcPoint]
+		if !ok {
+			return fmt.Errorf(
+				"htlc resolver %T unavailable", resolver,
+			)
+		}
+
+		htlcResolver.Supplement(*htlc)
 	}
 
 	c.launchResolvers(unresolvedContracts)
 
-	return nil
-}
-
-// supplementResolver takes a resolver as it is restored from the log and fills
-// in missing data from the htlcMap.
-func (c *ChannelArbitrator) supplementResolver(resolver ContractResolver,
-	htlcMap map[wire.OutPoint]*channeldb.HTLC) error {
-
-	switch r := resolver.(type) {
-
-	case *htlcSuccessResolver:
-		return c.supplementSuccessResolver(r, htlcMap)
-
-	case *htlcIncomingContestResolver:
-		return c.supplementIncomingContestResolver(r, htlcMap)
-
-	case *htlcTimeoutResolver:
-		return c.supplementTimeoutResolver(r, htlcMap)
-
-	case *htlcOutgoingContestResolver:
-		return c.supplementTimeoutResolver(
-			&r.htlcTimeoutResolver, htlcMap,
-		)
-	}
-
-	return nil
-}
-
-// supplementSuccessResolver takes a htlcIncomingContestResolver as it is
-// restored from the log and fills in missing data from the htlcMap.
-func (c *ChannelArbitrator) supplementIncomingContestResolver(
-	r *htlcIncomingContestResolver,
-	htlcMap map[wire.OutPoint]*channeldb.HTLC) error {
-
-	res := r.htlcResolution
-	htlcPoint := res.HtlcPoint()
-	htlc, ok := htlcMap[htlcPoint]
-	if !ok {
-		return errors.New(
-			"htlc for incoming contest resolver unavailable",
-		)
-	}
-
-	r.htlcAmt = htlc.Amt
-	r.circuitKey = channeldb.CircuitKey{
-		ChanID: c.cfg.ShortChanID,
-		HtlcID: htlc.HtlcIndex,
-	}
-
-	return nil
-}
-
-// supplementSuccessResolver takes a htlcSuccessResolver as it is restored from
-// the log and fills in missing data from the htlcMap.
-func (c *ChannelArbitrator) supplementSuccessResolver(r *htlcSuccessResolver,
-	htlcMap map[wire.OutPoint]*channeldb.HTLC) error {
-
-	res := r.htlcResolution
-	htlcPoint := res.HtlcPoint()
-	htlc, ok := htlcMap[htlcPoint]
-	if !ok {
-		return errors.New(
-			"htlc for success resolver unavailable",
-		)
-	}
-	r.htlcAmt = htlc.Amt
-	return nil
-}
-
-// supplementTimeoutResolver takes a htlcSuccessResolver as it is restored from
-// the log and fills in missing data from the htlcMap.
-func (c *ChannelArbitrator) supplementTimeoutResolver(r *htlcTimeoutResolver,
-	htlcMap map[wire.OutPoint]*channeldb.HTLC) error {
-
-	res := r.htlcResolution
-	htlcPoint := res.HtlcPoint()
-	htlc, ok := htlcMap[htlcPoint]
-	if !ok {
-		return errors.New(
-			"htlc for timeout resolver unavailable",
-		)
-	}
-	r.htlcAmt = htlc.Amt
 	return nil
 }
 
@@ -911,27 +877,6 @@ func (c *ChannelArbitrator) stateStep(
 			break
 		}
 
-		// If we've have broadcast the commitment transaction, we send
-		// our commitment output for incubation, but only if it wasn't
-		// trimmed.  We'll need to wait for a CSV timeout before we can
-		// reclaim the funds.
-		commitRes := contractResolutions.CommitResolution
-		if commitRes != nil && commitRes.MaturityDelay > 0 {
-			log.Infof("ChannelArbitrator(%v): sending commit "+
-				"output for incubation", c.cfg.ChanPoint)
-
-			err = c.cfg.IncubateOutputs(
-				c.cfg.ChanPoint, commitRes,
-				nil, nil, triggerHeight,
-			)
-			if err != nil {
-				// TODO(roasbeef): check for AlreadyExists errors
-				log.Errorf("unable to incubate commitment "+
-					"output: %v", err)
-				return StateError, closeTx, err
-			}
-		}
-
 		// Now that we know we'll need to act, we'll process the htlc
 		// actions, wen create the structures we need to resolve all
 		// outstanding contracts.
@@ -1204,8 +1149,10 @@ func (c *ChannelArbitrator) checkCommitChainActions(height uint32,
 	//  * race condition if adding and we broadcast, etc
 	//  * or would make each instance sync?
 
-	log.Debugf("ChannelArbitrator(%v): checking chain actions at "+
-		"height=%v", c.cfg.ChanPoint, height)
+	log.Debugf("ChannelArbitrator(%v): checking commit chain actions at "+
+		"height=%v, in_htlc_count=%v, out_htlc_count=%v",
+		c.cfg.ChanPoint, height,
+		len(htlcs.incomingHTLCs), len(htlcs.outgoingHTLCs))
 
 	actionMap := make(ChainActionMap)
 
@@ -1665,7 +1612,7 @@ func (c *ChannelArbitrator) prepContractResolutions(
 
 	// We'll create the resolver kit that we'll be cloning for each
 	// resolver so they each can do their duty.
-	resKit := ResolverKit{
+	resolverCfg := ResolverConfig{
 		ChannelArbitratorConfig: c.cfg,
 		Checkpoint: func(res ContractResolver) error {
 			return c.log.InsertUnresolvedContracts(res)
@@ -1699,6 +1646,8 @@ func (c *ChannelArbitrator) prepContractResolutions(
 		// claim the HTLC (second-level or directly), then add the pre
 		case HtlcClaimAction:
 			for _, htlc := range htlcs {
+				htlc := htlc
+
 				htlcOp := wire.OutPoint{
 					Hash:  commitHash,
 					Index: uint32(htlc.OutputIndex),
@@ -1713,14 +1662,9 @@ func (c *ChannelArbitrator) prepContractResolutions(
 					continue
 				}
 
-				resKit.Quit = make(chan struct{})
-				resolver := &htlcSuccessResolver{
-					htlcResolution:  resolution,
-					broadcastHeight: height,
-					payHash:         htlc.RHash,
-					htlcAmt:         htlc.Amt,
-					ResolverKit:     resKit,
-				}
+				resolver := newSuccessResolver(
+					resolution, height, htlc, resolverCfg,
+				)
 				htlcResolvers = append(htlcResolvers, resolver)
 			}
 
@@ -1729,6 +1673,8 @@ func (c *ChannelArbitrator) prepContractResolutions(
 		// backwards.
 		case HtlcTimeoutAction:
 			for _, htlc := range htlcs {
+				htlc := htlc
+
 				htlcOp := wire.OutPoint{
 					Hash:  commitHash,
 					Index: uint32(htlc.OutputIndex),
@@ -1741,14 +1687,9 @@ func (c *ChannelArbitrator) prepContractResolutions(
 					continue
 				}
 
-				resKit.Quit = make(chan struct{})
-				resolver := &htlcTimeoutResolver{
-					htlcResolution:  resolution,
-					broadcastHeight: height,
-					htlcIndex:       htlc.HtlcIndex,
-					htlcAmt:         htlc.Amt,
-					ResolverKit:     resKit,
-				}
+				resolver := newTimeoutResolver(
+					resolution, height, htlc, resolverCfg,
+				)
 				htlcResolvers = append(htlcResolvers, resolver)
 			}
 
@@ -1757,6 +1698,8 @@ func (c *ChannelArbitrator) prepContractResolutions(
 		// learn of the pre-image, or let the remote party time out.
 		case HtlcIncomingWatchAction:
 			for _, htlc := range htlcs {
+				htlc := htlc
+
 				htlcOp := wire.OutPoint{
 					Hash:  commitHash,
 					Index: uint32(htlc.OutputIndex),
@@ -1773,23 +1716,10 @@ func (c *ChannelArbitrator) prepContractResolutions(
 					continue
 				}
 
-				circuitKey := channeldb.CircuitKey{
-					HtlcID: htlc.HtlcIndex,
-					ChanID: c.cfg.ShortChanID,
-				}
-
-				resKit.Quit = make(chan struct{})
-				resolver := &htlcIncomingContestResolver{
-					htlcExpiry: htlc.RefundTimeout,
-					circuitKey: circuitKey,
-					htlcSuccessResolver: htlcSuccessResolver{
-						htlcResolution:  resolution,
-						broadcastHeight: height,
-						payHash:         htlc.RHash,
-						htlcAmt:         htlc.Amt,
-						ResolverKit:     resKit,
-					},
-				}
+				resolver := newIncomingContestResolver(
+					resolution, height, htlc,
+					resolverCfg,
+				)
 				htlcResolvers = append(htlcResolvers, resolver)
 			}
 
@@ -1798,6 +1728,8 @@ func (c *ChannelArbitrator) prepContractResolutions(
 		// backwards), or just timeout.
 		case HtlcOutgoingWatchAction:
 			for _, htlc := range htlcs {
+				htlc := htlc
+
 				htlcOp := wire.OutPoint{
 					Hash:  commitHash,
 					Index: uint32(htlc.OutputIndex),
@@ -1811,16 +1743,9 @@ func (c *ChannelArbitrator) prepContractResolutions(
 					continue
 				}
 
-				resKit.Quit = make(chan struct{})
-				resolver := &htlcOutgoingContestResolver{
-					htlcTimeoutResolver: htlcTimeoutResolver{
-						htlcResolution:  resolution,
-						broadcastHeight: height,
-						htlcIndex:       htlc.HtlcIndex,
-						htlcAmt:         htlc.Amt,
-						ResolverKit:     resKit,
-					},
-				}
+				resolver := newOutgoingContestResolver(
+					resolution, height, htlc, resolverCfg,
+				)
 				htlcResolvers = append(htlcResolvers, resolver)
 			}
 		}
@@ -1830,14 +1755,10 @@ func (c *ChannelArbitrator) prepContractResolutions(
 	// a resolver to sweep our commitment output (but only if it wasn't
 	// trimmed).
 	if contractResolutions.CommitResolution != nil {
-		resKit.Quit = make(chan struct{})
-		resolver := &commitSweepResolver{
-			commitResolution: *contractResolutions.CommitResolution,
-			broadcastHeight:  height,
-			chanPoint:        c.cfg.ChanPoint,
-			ResolverKit:      resKit,
-		}
-
+		resolver := newCommitSweepResolver(
+			*contractResolutions.CommitResolution,
+			height, c.cfg.ChanPoint, resolverCfg,
+		)
 		htlcResolvers = append(htlcResolvers, resolver)
 	}
 

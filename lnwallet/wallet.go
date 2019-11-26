@@ -21,6 +21,8 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"github.com/lightningnetwork/lnd/lnwallet/chanvalidate"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/shachain"
 )
@@ -88,11 +90,11 @@ type InitFundingReserveMsg struct {
 	// of initial commitment transactions. In order to ensure timely
 	// confirmation, it is recommended that this fee should be generous,
 	// paying some multiple of the accepted base fee rate of the network.
-	CommitFeePerKw SatPerKWeight
+	CommitFeePerKw chainfee.SatPerKWeight
 
 	// FundingFeePerKw is the fee rate in sat/kw to use for the initial
 	// funding transaction.
-	FundingFeePerKw SatPerKWeight
+	FundingFeePerKw chainfee.SatPerKWeight
 
 	// PushMSat is the number of milli-satoshis that should be pushed over
 	// the responder as part of the initial channel creation.
@@ -344,6 +346,8 @@ func (l *LightningWallet) Shutdown() error {
 func (l *LightningWallet) LockedOutpoints() []*wire.OutPoint {
 	outPoints := make([]*wire.OutPoint, 0, len(l.lockedOutPoints))
 	for outPoint := range l.lockedOutPoints {
+		outPoint := outPoint
+
 		outPoints = append(outPoints, &outPoint)
 	}
 
@@ -363,7 +367,7 @@ func (l *LightningWallet) ResetReservations() {
 }
 
 // ActiveReservations returns a slice of all the currently active
-// (non-cancelled) reservations.
+// (non-canceled) reservations.
 func (l *LightningWallet) ActiveReservations() []*ChannelReservation {
 	reservations := make([]*ChannelReservation, 0, len(l.fundingLimbo))
 	for _, reservation := range l.fundingLimbo {
@@ -520,7 +524,7 @@ func (l *LightningWallet) handleFundingReserveRequest(req *InitFundingReserveMsg
 
 	// Funding reservation request successfully handled. The funding inputs
 	// will be marked as unavailable until the reservation is either
-	// completed, or cancelled.
+	// completed, or canceled.
 	req.resp <- reservation
 	req.err <- nil
 }
@@ -1322,7 +1326,7 @@ type coinSelection struct {
 // returned, and the value of the resulting funding output. This method locks
 // the selected outputs, and a function closure to unlock them in case of an
 // error is returned.
-func (l *LightningWallet) selectCoinsAndChange(feeRate SatPerKWeight,
+func (l *LightningWallet) selectCoinsAndChange(feeRate chainfee.SatPerKWeight,
 	amt btcutil.Amount, minConfs int32, subtractFees bool) (
 	*coinSelection, error) {
 
@@ -1484,7 +1488,7 @@ func selectInputs(amt btcutil.Amount, coins []*Utxo) (btcutil.Amount, []*Utxo, e
 // change output to fund amt satoshis, adhering to the specified fee rate. The
 // specified fee rate should be expressed in sat/kw for coin selection to
 // function properly.
-func coinSelect(feeRate SatPerKWeight, amt btcutil.Amount,
+func coinSelect(feeRate chainfee.SatPerKWeight, amt btcutil.Amount,
 	coins []*Utxo) ([]*Utxo, btcutil.Amount, error) {
 
 	amtNeeded := amt
@@ -1548,7 +1552,7 @@ func coinSelect(feeRate SatPerKWeight, amt btcutil.Amount,
 // coinSelectSubtractFees attempts to select coins such that we'll spend up to
 // amt in total after fees, adhering to the specified fee rate. The selected
 // coins, the final output and change values are returned.
-func coinSelectSubtractFees(feeRate SatPerKWeight, amt,
+func coinSelectSubtractFees(feeRate chainfee.SatPerKWeight, amt,
 	dustLimit btcutil.Amount, coins []*Utxo) ([]*Utxo, btcutil.Amount,
 	btcutil.Amount, error) {
 
@@ -1635,4 +1639,59 @@ func coinSelectSubtractFees(feeRate SatPerKWeight, amt,
 	}
 
 	return selectedUtxos, outputAmt, changeAmt, nil
+}
+
+// ValidateChannel will attempt to fully validate a newly mined channel, given
+// its funding transaction and existing channel state. If this method returns
+// an error, then the mined channel is invalid, and shouldn't be used.
+func (l *LightningWallet) ValidateChannel(channelState *channeldb.OpenChannel,
+	fundingTx *wire.MsgTx) error {
+
+	// First, we'll obtain a fully signed commitment transaction so we can
+	// pass into it on the chanvalidate package for verification.
+	channel, err := NewLightningChannel(l.Cfg.Signer, channelState, nil)
+	if err != nil {
+		return err
+	}
+	signedCommitTx, err := channel.getSignedCommitTx()
+	if err != nil {
+		return err
+	}
+
+	// We'll also need the multi-sig witness script itself so the
+	// chanvalidate package can check it for correctness against the
+	// funding transaction, and also commitment validity.
+	localKey := channelState.LocalChanCfg.MultiSigKey.PubKey
+	remoteKey := channelState.RemoteChanCfg.MultiSigKey.PubKey
+	witnessScript, err := input.GenMultiSigScript(
+		localKey.SerializeCompressed(),
+		remoteKey.SerializeCompressed(),
+	)
+	if err != nil {
+		return err
+	}
+	pkScript, err := input.WitnessScriptHash(witnessScript)
+	if err != nil {
+		return err
+	}
+
+	// Finally, we'll pass in all the necessary context needed to fully
+	// validate that this channel is indeed what we expect, and can be
+	// used.
+	_, err = chanvalidate.Validate(&chanvalidate.Context{
+		Locator: &chanvalidate.OutPointChanLocator{
+			ChanPoint: channelState.FundingOutpoint,
+		},
+		MultiSigPkScript: pkScript,
+		FundingTx:        fundingTx,
+		CommitCtx: &chanvalidate.CommitmentContext{
+			Value:               channel.Capacity,
+			FullySignedCommitTx: signedCommitTx,
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
